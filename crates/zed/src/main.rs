@@ -1455,7 +1455,7 @@ async fn repository_paths(fs: &dyn Fs, paths: &[PathBuf]) -> Vec<PathBuf> {
     let mut repositories = Vec::with_capacity(paths.len());
     for path in paths {
         repositories.push(
-            match project::discover_root_repo_common_dir(path, fs).await {
+            match project::discover_root_repo_group_common_dir(path, fs).await {
                 Some(common_dir) if !project::is_submodule_git_dir(&common_dir) => {
                     project::repo_identity_path(&common_dir, PathStyle::local()).to_path_buf()
                 }

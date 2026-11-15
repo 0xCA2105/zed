@@ -96,6 +96,92 @@ async fn test_root_repo_common_dir_sync(
 }
 
 #[gpui::test]
+async fn test_collab_guest_keeps_git_identity_for_delta_checkout(
+    executor: BackgroundExecutor,
+    cx_a: &mut TestAppContext,
+    cx_b: &mut TestAppContext,
+) {
+    let mut server = TestServer::start(executor.clone()).await;
+    let client_a = server.create_client(cx_a, "user_a").await;
+    let client_b = server.create_client(cx_b, "user_b").await;
+    server
+        .create_room(&mut [(&client_a, cx_a), (&client_b, cx_b)])
+        .await;
+    let active_call_a = cx_a.read(ActiveCall::global);
+    let clone_path = path!("/repo/.delta/clones/abc/repo.git");
+    let checkout_path = path!("/repo/.delta/worktrees/abc/repo");
+    client_a
+        .fs()
+        .insert_tree(
+            path!("/repo"),
+            json!({
+                ".git": { "HEAD": "ref: refs/heads/main\n" },
+                ".delta": {
+                    "clones": {
+                        "abc": {
+                            "repo.git": {
+                                "HEAD": "ref: refs/heads/feature\n",
+                                "config": "[core]\n\tbare = false\n",
+                                "delta": { "copy-baseline": "" },
+                                "objects": {
+                                    "info": {
+                                        "alternates": format!(
+                                            "{}\n",
+                                            path!("/repo/.git/objects")
+                                        )
+                                    }
+                                },
+                            },
+                        },
+                    },
+                    "worktrees": {
+                        "abc": { "repo": { ".git": format!("gitdir: {clone_path}\n") } },
+                    },
+                },
+            }),
+        )
+        .await;
+    let (project_a, _) = client_a.build_local_project(checkout_path, cx_a).await;
+    executor.run_until_parked();
+    let project_id = active_call_a
+        .update(cx_a, |call, cx| call.share_project(project_a.clone(), cx))
+        .await
+        .unwrap();
+    let project_b = client_b.join_remote_project(project_id, cx_b).await;
+    executor.run_until_parked();
+    client_a
+        .fs()
+        .insert_file(Path::new(checkout_path).join("file.txt"), Vec::new())
+        .await;
+    executor.run_until_parked();
+
+    let identity = |project: &Entity<project::Project>, cx: &mut TestAppContext| {
+        project.read_with(cx, |project, cx| {
+            let worktree = project.worktrees(cx).next().unwrap();
+            (
+                worktree.read(cx).root_repo_source_common_dir().cloned(),
+                project
+                    .worktree_paths(cx)
+                    .main_worktree_path_list()
+                    .paths()
+                    .to_vec(),
+            )
+        })
+    };
+    let source_common_dir = Some(Arc::<Path>::from(Path::new(path!("/repo/.git"))));
+    assert_eq!(
+        (identity(&project_a, cx_a), identity(&project_b, cx_b)),
+        (
+            (
+                source_common_dir.clone(),
+                vec![PathBuf::from(path!("/repo"))]
+            ),
+            (source_common_dir, vec![PathBuf::from(clone_path)]),
+        )
+    );
+}
+
+#[gpui::test]
 async fn test_remote_file_permalink(
     executor: BackgroundExecutor,
     cx_a: &mut TestAppContext,

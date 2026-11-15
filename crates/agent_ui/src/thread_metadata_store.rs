@@ -4003,6 +4003,33 @@ mod tests {
     }
 
     #[test]
+    fn test_thread_worktree_paths_add_replaces_main_path_of_existing_folder() {
+        let mut paths = make_worktree_paths(&[
+            ("/projects/zed", "/worktrees/selectric/zed"),
+            ("/projects/cloud", "/projects/cloud"),
+        ]);
+
+        paths.add_path(
+            Path::new("/projects/zed-renamed"),
+            Path::new("/worktrees/selectric/zed"),
+        );
+
+        assert_eq!(
+            paths
+                .ordered_pairs()
+                .map(|(main_path, folder_path)| (main_path.as_path(), folder_path.as_path()))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    Path::new("/projects/zed-renamed"),
+                    Path::new("/worktrees/selectric/zed")
+                ),
+                (Path::new("/projects/cloud"), Path::new("/projects/cloud")),
+            ]
+        );
+    }
+
+    #[test]
     fn test_thread_worktree_paths_remove_nonexistent_is_noop() {
         let mut paths = make_worktree_paths(&[("/projects/zed", "/worktrees/selectric/zed")]);
 

@@ -987,6 +987,7 @@ async fn test_windows_style_abs_path_trust_from_unix_client(cx: &mut TestAppCont
             abs_path: abs_path.to_string(),
             root_repo_common_dir: None,
             root_repo_is_linked_worktree: false,
+            root_repo_source_common_dir: None,
         };
         let worktree = cx.update(|cx| {
             Worktree::remote(
@@ -1031,6 +1032,7 @@ async fn test_windows_style_abs_path_trust_from_unix_client(cx: &mut TestAppCont
                     removed_repositories: vec![],
                     root_repo_common_dir: None,
                     root_repo_is_linked_worktree: false,
+                    root_repo_source_common_dir: None,
                 });
         });
         cx.run_until_parked();

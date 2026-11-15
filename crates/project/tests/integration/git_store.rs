@@ -2000,6 +2000,24 @@ mod resolve_worktree_tests {
                 PathStyle::Windows,
                 Some("zed2".into()),
             ),
+            (
+                "/home/bob/zed/.delta/clones/one/zed.git",
+                "/home/bob/zed/.delta/worktrees/one/zed",
+                PathStyle::Unix,
+                Some("one".into()),
+            ),
+            (
+                r"C:\Users\bob\dev\renamed",
+                r"C:\Users\bob\dev\renamed\.delta\worktrees\one\zed",
+                PathStyle::Windows,
+                Some("one".into()),
+            ),
+            (
+                "/home/bob/repos/zed.git",
+                "/home/bob/code/zed",
+                PathStyle::Unix,
+                Some("zed".into()),
+            ),
         ];
         for (main_worktree_path, linked_worktree_path, path_style, expected) in examples {
             let short_name = linked_worktree_short_name(

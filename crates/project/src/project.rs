@@ -151,7 +151,7 @@ use worktree::{CreatedEntry, Snapshot, Traversal};
 pub use worktree::{
     Entry, EntryKind, FS_WATCH_LATENCY, File, LocalWorktree, PathChange, ProjectEntryId,
     UpdatedEntriesSet, UpdatedGitRepositoriesSet, Worktree, WorktreeId, WorktreeSettings,
-    discover_root_repo_common_dir,
+    discover_root_repo_group_common_dir, discover_root_repo_source_common_dir,
 };
 use worktree_store::{WorktreeStore, WorktreeStoreEvent};
 
@@ -2282,6 +2282,7 @@ impl Project {
                 abs_path: abs_path.to_string(),
                 root_repo_common_dir: None,
                 root_repo_is_linked_worktree: false,
+                root_repo_source_common_dir: None,
             },
             client,
             PathStyle::Unix,
@@ -6881,7 +6882,14 @@ impl Project {
     }
 
     pub fn worktree_paths(&self, cx: &App) -> WorktreePaths {
+        if self.is_via_collab() {
+            return self.git_worktree_paths(cx);
+        }
         self.worktree_store.read(cx).paths(cx)
+    }
+
+    pub fn git_worktree_paths(&self, cx: &App) -> WorktreePaths {
+        self.worktree_store.read(cx).git_paths(cx)
     }
 
     pub fn project_group_key(&self, cx: &App) -> ProjectGroupKey {

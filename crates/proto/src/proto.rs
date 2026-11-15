@@ -1012,6 +1012,7 @@ pub fn split_worktree_update(mut message: UpdateWorktree) -> impl Iterator<Item 
             abs_path: message.abs_path.clone(),
             root_repo_common_dir: message.root_repo_common_dir.clone(),
             root_repo_is_linked_worktree: message.root_repo_is_linked_worktree,
+            root_repo_source_common_dir: message.root_repo_source_common_dir.clone(),
             updated_entries,
             removed_entries,
             scan_id: message.scan_id,

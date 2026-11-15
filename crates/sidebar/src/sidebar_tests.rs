@@ -13257,6 +13257,205 @@ async fn test_activating_workspace_with_draft_does_not_create_extras(cx: &mut Te
 }
 
 #[gpui::test]
+async fn test_delta_checkout_groups_with_its_source(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    let source_path = Path::new(util::path!("/repo"));
+    let next_source_path = Path::new(util::path!("/next"));
+    let first_clone_path = Path::new(util::path!("/repo/.delta/clones/abc/repo.git"));
+    let first_checkout_path = Path::new(util::path!("/repo/.delta/worktrees/abc/repo"));
+    let second_clone_path = Path::new(util::path!("/repo/.delta/clones/def/repo.git"));
+    let second_checkout_path = Path::new(util::path!("/repo/.delta/worktrees/def/repo"));
+    let delta_clone = || {
+        serde_json::json!({
+            "HEAD": "ref: refs/heads/feature\n",
+            "config": "[core]\n\tbare = false\n",
+            "delta": { "copy-baseline": "" },
+            "objects": {
+                "info": {
+                    "alternates": format!("{}\n", util::path!("/repo/.git/objects")),
+                },
+            },
+        })
+    };
+    fs.insert_tree(
+        source_path,
+        serde_json::json!({
+            ".git": { "HEAD": "ref: refs/heads/main\n" },
+            ".delta": {
+                "clones": {
+                    "abc": { "repo.git": delta_clone() },
+                    "def": { "repo.git": delta_clone() },
+                },
+                "worktrees": {
+                    "abc": {
+                        "repo": { ".git": format!("gitdir: {}\n", first_clone_path.display()) },
+                    },
+                    "def": {
+                        "repo": { ".git": format!("gitdir: {}\n", second_clone_path.display()) },
+                    },
+                },
+            },
+        }),
+    )
+    .await;
+    fs.insert_tree(
+        next_source_path,
+        serde_json::json!({ ".git": { "HEAD": "ref: refs/heads/main\n" } }),
+    )
+    .await;
+    save_thread_metadata_with_main_paths(
+        "First",
+        "First",
+        PathList::new(&[first_checkout_path]),
+        PathList::new(&[source_path]),
+        chrono::TimeZone::with_ymd_and_hms(&Utc, 2024, 1, 1, 0, 0, 0).unwrap(),
+        cx,
+    );
+    let source_project = project::Project::test(fs.clone(), [source_path], cx).await;
+    let first_project = project::Project::test(fs.clone(), [first_checkout_path], cx).await;
+    let second_project = project::Project::test(fs.clone(), [second_checkout_path], cx).await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(source_project, window, cx));
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.retain_active_workspace(cx);
+        multi_workspace.test_add_workspace(first_project, window, cx);
+        multi_workspace.test_add_workspace(second_project, window, cx);
+    });
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+    let group_paths = |cx: &mut gpui::VisualTestContext| {
+        cx.run_until_parked();
+        multi_workspace.read_with(cx, |multi_workspace, _| {
+            multi_workspace
+                .project_group_keys()
+                .into_iter()
+                .map(|key| key.path_list().clone())
+                .collect::<Vec<_>>()
+        })
+    };
+    let first_main_paths = |cx: &mut gpui::VisualTestContext| {
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            ThreadMetadataStore::global(cx)
+                .read(cx)
+                .entries()
+                .find(|thread| thread.display_title().as_ref() == "First")
+                .map(|thread| thread.main_worktree_paths().paths().to_vec())
+        })
+    };
+
+    let group_paths_with_source = group_paths(cx);
+    let entries_with_source = visible_entries_as_strings(&sidebar, cx);
+    let mut default_branch_cache_paths = sidebar.read_with(cx, |sidebar, _| {
+        sidebar
+            .worktree_default_branches
+            .keys()
+            .map(|key| key.path_list().paths().to_vec())
+            .collect::<Vec<_>>()
+    });
+    default_branch_cache_paths.sort();
+    let branch_name = |root_path: &Path| {
+        format!(
+            "origin/{}",
+            root_path.to_string_lossy().replace(['/', '\\', ':'], "-")
+        )
+    };
+    let default_branches = sidebar.update(cx, |sidebar, cx| {
+        for repository_path in [source_path, first_clone_path, second_clone_path] {
+            sidebar.worktree_default_branches.insert(
+                ProjectGroupKey::new(None, PathList::new(&[repository_path])),
+                DefaultBranchCache::Resolved(RemoteBranchName::parse(&branch_name(
+                    repository_path,
+                ))),
+            );
+        }
+        let mut default_branches = multi_workspace
+            .read(cx)
+            .workspaces()
+            .map(|workspace| {
+                (
+                    workspace.read(cx).root_paths(cx)[0].to_path_buf(),
+                    sidebar
+                        .worktree_default_branch(workspace, cx)
+                        .map(|branch| branch.display_name()),
+                )
+            })
+            .collect::<Vec<_>>();
+        default_branches.sort();
+        default_branches
+    });
+    let mut menu_labels = cx.update(|_, cx| {
+        multi_workspace
+            .read(cx)
+            .workspaces()
+            .flat_map(|workspace| workspace_menu_worktree_labels(workspace, cx))
+            .map(|label| label.primary_name.to_string())
+            .collect::<Vec<_>>()
+    });
+    menu_labels.sort();
+
+    fs.insert_file(
+        first_clone_path.join("objects/info/alternates"),
+        format!("{}\n", util::path!("/next/.git/objects")).into_bytes(),
+    )
+    .await;
+    let group_paths_with_next_source = group_paths(cx);
+    let first_main_paths_with_next_source = first_main_paths(cx);
+    fs.remove_file(
+        &first_clone_path.join("delta/copy-baseline"),
+        fs::RemoveOptions::default(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        (
+            group_paths_with_source,
+            entries_with_source,
+            default_branch_cache_paths,
+            default_branches,
+            menu_labels,
+            group_paths_with_next_source,
+            first_main_paths_with_next_source,
+            group_paths(cx),
+            first_main_paths(cx),
+        ),
+        (
+            vec![PathList::new(&[source_path])],
+            vec!["v [repo]".to_string(), "  First {abc}".to_string()],
+            vec![
+                vec![source_path.to_path_buf()],
+                vec![first_clone_path.to_path_buf()],
+                vec![second_clone_path.to_path_buf()],
+            ],
+            vec![
+                (source_path.to_path_buf(), Some(branch_name(source_path))),
+                (
+                    first_checkout_path.to_path_buf(),
+                    Some(branch_name(first_clone_path)),
+                ),
+                (
+                    second_checkout_path.to_path_buf(),
+                    Some(branch_name(second_clone_path)),
+                ),
+            ],
+            vec!["abc".to_string(), "def".to_string(), "main".to_string()],
+            vec![
+                PathList::new(&[source_path]),
+                PathList::new(&[next_source_path]),
+            ],
+            Some(vec![next_source_path.to_path_buf()]),
+            vec![
+                PathList::new(&[source_path]),
+                PathList::new(&[next_source_path]),
+            ],
+            Some(vec![next_source_path.to_path_buf()]),
+        )
+    );
+}
+
+#[gpui::test]
 async fn test_non_archive_thread_paths_migrate_on_worktree_add_and_remove(cx: &mut TestAppContext) {
     // Historical threads (not open in any agent panel) should have their
     // worktree paths updated when a folder is added to or removed from the

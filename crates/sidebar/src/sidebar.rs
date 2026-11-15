@@ -649,6 +649,14 @@ impl WorkspaceMenuWorktreeLabel {
     }
 }
 
+fn git_project_group_key(workspace: &Entity<Workspace>, cx: &App) -> ProjectGroupKey {
+    let project = workspace.read(cx).project().read(cx);
+    ProjectGroupKey::from_worktree_paths(
+        &project.git_worktree_paths(cx),
+        project.remote_connection_options(cx).cloned(),
+    )
+}
+
 fn workspace_menu_worktree_labels(
     workspace: &Entity<Workspace>,
     cx: &App,
@@ -656,7 +664,7 @@ fn workspace_menu_worktree_labels(
     let root_paths = workspace.read(cx).root_paths(cx);
     let show_folder_name = root_paths.len() > 1;
     let project = workspace.read(cx).project().clone();
-    let (path_style, repository_snapshots) = {
+    let (path_style, repository_snapshots, worktree_paths, git_worktree_paths) = {
         let project = project.read(cx);
         let path_style = project.path_style(cx);
         let repository_snapshots = project
@@ -664,7 +672,12 @@ fn workspace_menu_worktree_labels(
             .values()
             .map(|repo| repo.read(cx).snapshot())
             .collect::<Vec<_>>();
-        (path_style, repository_snapshots)
+        (
+            path_style,
+            repository_snapshots,
+            project.worktree_paths(cx),
+            project.git_worktree_paths(cx),
+        )
     };
 
     root_paths
@@ -679,6 +692,14 @@ fn workspace_menu_worktree_labels(
                 .iter()
                 .find(|snapshot| snapshot.work_directory_abs_path.as_ref() == root_path);
 
+            let source_main_path = worktree_paths
+                .ordered_pairs()
+                .zip(git_worktree_paths.ordered_pairs())
+                .find(|((main_path, folder_path), (git_main_path, _))| {
+                    folder_path.as_path() == root_path && main_path != git_main_path
+                })
+                .map(|((main_path, _), _)| main_path);
+
             if let Some(snapshot) = repository_snapshot {
                 let worktree_name = if snapshot.is_linked_worktree() {
                     project::linked_worktree_short_name(
@@ -687,6 +708,9 @@ fn workspace_menu_worktree_labels(
                         snapshot.path_style,
                     )
                     .unwrap_or_else(|| folder_name.clone())
+                } else if let Some(source_main_path) = source_main_path {
+                    project::linked_worktree_short_name(source_main_path, root_path, path_style)
+                        .unwrap_or_else(|| folder_name.clone())
                 } else {
                     "main".into()
                 };
@@ -2731,7 +2755,6 @@ impl Sidebar {
 
                     if let Some(base_workspace) = base_workspace.filter(|_| !creation_blocked) {
                         menu = menu.separator().submenu("Create New Worktree…", {
-                            let this = this.clone();
                             move |mut submenu, _window, submenu_cx| {
                                 let project = base_workspace.read(submenu_cx).project().clone();
                                 let project_ref = project.read(submenu_cx);
@@ -2745,13 +2768,8 @@ impl Sidebar {
                                             .map(|branch| branch.name().to_string())
                                     });
                                 let default_branch = this
-                                    .read_with(submenu_cx, |sidebar, _| {
-                                        match sidebar.worktree_default_branches.get(&key) {
-                                            Some(DefaultBranchCache::Resolved(branch)) => {
-                                                branch.clone()
-                                            }
-                                            _ => None,
-                                        }
+                                    .read_with(submenu_cx, |sidebar, cx| {
+                                        sidebar.worktree_default_branch(&base_workspace, cx)
                                     })
                                     .ok()
                                     .flatten();
@@ -2798,36 +2816,36 @@ impl Sidebar {
         .into_any_element()
     }
 
-    // Warms `worktree_default_branches` for every project group with at least one
-    // open workspace. The git query runs off the menu path so the submenu can read
-    // the result synchronously when it opens. Worktrees of a repository share the
-    // same default branch, so any workspace in the group yields the same answer.
     fn prefetch_worktree_default_branches(&mut self, cx: &mut Context<Self>) {
         let Some(multi_workspace) = self.multi_workspace.upgrade() else {
             return;
         };
-        let keys: Vec<ProjectGroupKey> = self
-            .contents
-            .entries
-            .iter()
-            .filter_map(|entry| match entry {
-                ListEntry::ProjectHeader { key, .. } => Some(key.clone()),
-                _ => None,
-            })
-            .collect();
-        for key in keys {
-            if self.worktree_default_branches.contains_key(&key) {
-                continue;
-            }
-            let Some(base) = multi_workspace
-                .read(cx)
-                .workspaces_for_project_group(&key, cx)
-                .next()
-                .cloned()
-            else {
-                continue;
-            };
-            self.prefetch_worktree_default_branch(&key, &base, cx);
+        let workspaces = multi_workspace
+            .read(cx)
+            .workspaces()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut default_branch_keys = HashSet::new();
+        for workspace in workspaces {
+            let default_branch_key = git_project_group_key(&workspace, cx);
+            self.prefetch_worktree_default_branch(&default_branch_key, &workspace, cx);
+            default_branch_keys.insert(default_branch_key);
+        }
+        self.worktree_default_branches
+            .retain(|default_branch_key, _| default_branch_keys.contains(default_branch_key));
+    }
+
+    fn worktree_default_branch(
+        &self,
+        workspace: &Entity<Workspace>,
+        cx: &App,
+    ) -> Option<RemoteBranchName> {
+        match self
+            .worktree_default_branches
+            .get(&git_project_group_key(workspace, cx))
+        {
+            Some(DefaultBranchCache::Resolved(branch)) => branch.clone(),
+            _ => None,
         }
     }
 

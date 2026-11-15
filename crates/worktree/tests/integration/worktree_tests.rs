@@ -6761,6 +6761,7 @@ async fn test_remote_worktree_without_git_emits_root_repo_event_after_first_upda
                 abs_path: "/home/user/project".to_string(),
                 root_repo_common_dir: None,
                 root_repo_is_linked_worktree: false,
+                root_repo_source_common_dir: None,
             },
             client,
             PathStyle::Unix,
@@ -6820,6 +6821,7 @@ async fn test_remote_worktree_without_git_emits_root_repo_event_after_first_upda
                 removed_repositories: vec![],
                 root_repo_common_dir: None,
                 root_repo_is_linked_worktree: false,
+                root_repo_source_common_dir: None,
             });
     });
 
@@ -6855,6 +6857,7 @@ async fn test_remote_single_file_worktree_abs_path(cx: &mut TestAppContext) {
                 abs_path: "/home/user/.ssh/config".to_string(),
                 root_repo_common_dir: None,
                 root_repo_is_linked_worktree: false,
+                root_repo_source_common_dir: None,
             },
             AnyProtoClient::new(NoopProtoClient::new()),
             PathStyle::Unix,
@@ -6984,6 +6987,7 @@ fn test_remote_worktree_language_matching(cx: &mut TestAppContext) {
                     abs_path: abs_path.into(),
                     root_repo_common_dir: None,
                     root_repo_is_linked_worktree: false,
+                    root_repo_source_common_dir: None,
                 },
                 AnyProtoClient::new(NoopProtoClient::new()),
                 path_style,
@@ -7046,6 +7050,7 @@ async fn test_remote_worktree_with_git_emits_root_repo_event_when_repo_info_arri
                 abs_path: "/home/user/project".to_string(),
                 root_repo_common_dir: None,
                 root_repo_is_linked_worktree: false,
+                root_repo_source_common_dir: None,
             },
             client,
             PathStyle::Unix,
@@ -7102,6 +7107,7 @@ async fn test_remote_worktree_with_git_emits_root_repo_event_when_repo_info_arri
                 removed_repositories: vec![],
                 root_repo_common_dir: Some("/home/user/project/.git".to_string()),
                 root_repo_is_linked_worktree: false,
+                root_repo_source_common_dir: None,
             });
     });
 
@@ -7146,6 +7152,7 @@ async fn test_remote_worktree_root_repo_metadata_cleared_only_by_completed_scan(
                 abs_path: "/home/user/monty/feature-a".to_string(),
                 root_repo_common_dir: Some("/home/user/monty/.bare".to_string()),
                 root_repo_is_linked_worktree: true,
+                root_repo_source_common_dir: None,
             },
             client,
             PathStyle::Unix,
@@ -7176,6 +7183,7 @@ async fn test_remote_worktree_root_repo_metadata_cleared_only_by_completed_scan(
         removed_repositories: vec![],
         root_repo_common_dir: None,
         root_repo_is_linked_worktree: false,
+        root_repo_source_common_dir: None,
     };
 
     // A mid-scan update without repo info must not clobber the seeded
@@ -7262,6 +7270,7 @@ async fn test_remote_worktree_update_entries_carry_changed_paths(cx: &mut TestAp
                 abs_path: path!("/root").to_string(),
                 root_repo_common_dir: None,
                 root_repo_is_linked_worktree: false,
+                root_repo_source_common_dir: None,
             },
             AnyProtoClient::new(NoopProtoClient::new()),
             PathStyle::local(),

@@ -193,6 +193,7 @@ pub struct Snapshot {
     entries_by_id: SumTree<PathEntry>,
     root_repo_common_dir: Option<Arc<SanitizedPath>>,
     root_repo_is_linked_worktree: bool,
+    root_repo_source_common_dir: Option<Arc<SanitizedPath>>,
 
     /// A number that increases every time the worktree begins scanning
     /// a set of paths from the filesystem. This scanning could be caused
@@ -404,6 +405,7 @@ struct LocalRepositoryEntry {
     /// `common_dir_abs_path`. For a submodule or worktree, this is some subdirectory of the
     /// commondir like `/project/.git/modules/foo`.
     repository_dir_abs_path: Arc<Path>,
+    source_common_dir_abs_path: Option<Arc<Path>>,
 }
 
 impl sum_tree::Item for LocalRepositoryEntry {
@@ -513,18 +515,10 @@ impl Worktree {
             None
         };
 
-        let (root_repo_common_dir, root_repo_is_linked_worktree) = if visible {
-            discover_root_repo_metadata(&abs_path, fs.as_ref())
-                .await
-                .map(|(common_dir, is_linked_worktree)| {
-                    (
-                        Some(SanitizedPath::from_arc(common_dir)),
-                        is_linked_worktree,
-                    )
-                })
-                .unwrap_or((None, false))
+        let root_repo_metadata = if visible {
+            discover_root_repo_metadata(&abs_path, fs.as_ref()).await
         } else {
-            (None, false)
+            None
         };
         Ok(cx.new(move |cx: &mut Context<Worktree>| {
             let mut snapshot = LocalSnapshot {
@@ -546,8 +540,12 @@ impl Worktree {
                 ),
                 root_file_handle,
             };
-            snapshot.root_repo_common_dir = root_repo_common_dir;
-            snapshot.root_repo_is_linked_worktree = root_repo_is_linked_worktree;
+            if let Some(metadata) = root_repo_metadata {
+                snapshot.root_repo_common_dir = Some(SanitizedPath::from_arc(metadata.common_dir));
+                snapshot.root_repo_is_linked_worktree = metadata.is_linked_worktree;
+                snapshot.root_repo_source_common_dir =
+                    metadata.source_common_dir.map(SanitizedPath::from_arc);
+            }
 
             let worktree_id = snapshot.id();
             let settings_location = Some(SettingsLocation {
@@ -638,6 +636,9 @@ impl Worktree {
                 .root_repo_common_dir
                 .map(|p| SanitizedPath::new_arc(Path::new(&p)));
             snapshot.root_repo_is_linked_worktree = worktree.root_repo_is_linked_worktree;
+            snapshot.root_repo_source_common_dir = worktree
+                .root_repo_source_common_dir
+                .map(|path| SanitizedPath::new_arc(Path::new(&path)));
 
             let background_snapshot = Arc::new(Mutex::new((
                 snapshot.clone(),
@@ -702,6 +703,8 @@ impl Worktree {
                         let old_root_repo_common_dir = this.snapshot.root_repo_common_dir.clone();
                         let old_root_repo_is_linked_worktree =
                             this.snapshot.root_repo_is_linked_worktree;
+                        let old_root_repo_source_common_dir =
+                            this.snapshot.root_repo_source_common_dir.clone();
                         let mut changed_entries: Vec<(Arc<RelPath>, ProjectEntryId, PathChange)> =
                             Vec::new();
                         {
@@ -748,6 +751,8 @@ impl Worktree {
                         if this.snapshot.root_repo_common_dir != old_root_repo_common_dir
                             || this.snapshot.root_repo_is_linked_worktree
                                 != old_root_repo_is_linked_worktree
+                            || this.snapshot.root_repo_source_common_dir
+                                != old_root_repo_source_common_dir
                             || (is_first_update && this.snapshot.root_repo_common_dir.is_none())
                         {
                             cx.emit(Event::UpdatedRootRepoCommonDir {
@@ -844,6 +849,9 @@ impl Worktree {
                 .root_repo_common_dir()
                 .map(|p| p.to_string_lossy().into_owned()),
             root_repo_is_linked_worktree: self.root_repo_is_linked_worktree(),
+            root_repo_source_common_dir: self
+                .root_repo_source_common_dir()
+                .map(|path| path.to_string_lossy().into_owned()),
         }
     }
 
@@ -1450,26 +1458,33 @@ impl LocalWorktree {
     ) {
         let repo_changes = self.changed_repos(&self.snapshot, &mut new_snapshot);
 
-        if let Some((common_dir, is_linked_worktree)) = new_snapshot
+        if let Some((common_dir, is_linked_worktree, source_common_dir)) = new_snapshot
             .local_repo_for_work_directory_path(RelPath::empty())
             .map(|repo| {
                 (
                     SanitizedPath::from_arc(repo.common_dir_abs_path.clone()),
                     repo.repository_dir_abs_path != repo.common_dir_abs_path,
+                    repo.source_common_dir_abs_path
+                        .clone()
+                        .map(SanitizedPath::from_arc),
                 )
             })
         {
             new_snapshot.root_repo_common_dir = Some(common_dir);
             new_snapshot.root_repo_is_linked_worktree = is_linked_worktree;
+            new_snapshot.root_repo_source_common_dir = source_common_dir;
         } else {
             new_snapshot.root_repo_common_dir = None;
             new_snapshot.root_repo_is_linked_worktree = false;
+            new_snapshot.root_repo_source_common_dir = None;
         }
 
         let root_repo_metadata_changed = self.snapshot.root_repo_common_dir
             != new_snapshot.root_repo_common_dir
             || self.snapshot.root_repo_is_linked_worktree
-                != new_snapshot.root_repo_is_linked_worktree;
+                != new_snapshot.root_repo_is_linked_worktree
+            || self.snapshot.root_repo_source_common_dir
+                != new_snapshot.root_repo_source_common_dir;
         let old_root_repo_common_dir =
             root_repo_metadata_changed.then(|| self.snapshot.root_repo_common_dir.clone());
         self.snapshot = new_snapshot;
@@ -2544,6 +2559,7 @@ impl Snapshot {
             entries_by_id: Default::default(),
             root_repo_common_dir: None,
             root_repo_is_linked_worktree: false,
+            root_repo_source_common_dir: None,
             scan_id: 1,
             completed_scan_id: 0,
         }
@@ -2579,6 +2595,12 @@ impl Snapshot {
         self.root_repo_is_linked_worktree
     }
 
+    pub fn root_repo_source_common_dir(&self) -> Option<&Arc<Path>> {
+        self.root_repo_source_common_dir
+            .as_ref()
+            .map(SanitizedPath::cast_arc_ref)
+    }
+
     fn build_initial_update(&self, project_id: u64, worktree_id: u64) -> proto::UpdateWorktree {
         let mut updated_entries = self
             .entries_by_path
@@ -2596,6 +2618,9 @@ impl Snapshot {
                 .root_repo_common_dir()
                 .map(|p| p.to_string_lossy().into_owned()),
             root_repo_is_linked_worktree: self.root_repo_is_linked_worktree,
+            root_repo_source_common_dir: self
+                .root_repo_source_common_dir()
+                .map(|path| path.to_string_lossy().into_owned()),
             updated_entries,
             removed_entries: Vec::new(),
             scan_id: self.scan_id as u64,
@@ -2750,10 +2775,14 @@ impl Snapshot {
             Some(dir) => {
                 self.root_repo_common_dir = Some(dir);
                 self.root_repo_is_linked_worktree = update.root_repo_is_linked_worktree;
+                self.root_repo_source_common_dir = update
+                    .root_repo_source_common_dir
+                    .map(|path| SanitizedPath::new_arc(Path::new(&path)));
             }
             None if update.is_last_update => {
                 self.root_repo_common_dir = None;
                 self.root_repo_is_linked_worktree = false;
+                self.root_repo_source_common_dir = None;
             }
             None => {}
         }
@@ -3020,6 +3049,9 @@ impl LocalSnapshot {
                 .root_repo_common_dir()
                 .map(|p| p.to_string_lossy().into_owned()),
             root_repo_is_linked_worktree: self.root_repo_is_linked_worktree,
+            root_repo_source_common_dir: self
+                .root_repo_source_common_dir()
+                .map(|path| path.to_string_lossy().into_owned()),
             updated_entries,
             removed_entries,
             scan_id: self.scan_id as u64,
@@ -3644,6 +3676,17 @@ impl BackgroundScannerState {
         if repository_dir_abs_path != common_dir_abs_path {
             watch_git_dir_subdirectories(&repository_dir_abs_path, fs, watcher).await;
         }
+        let source_common_dir_abs_path = if work_directory.path_key().0.is_empty() {
+            watch_delta_source_inputs(&common_dir_abs_path, fs, watcher)
+                .await
+                .log_err();
+            discover_delta_source_common_dir(&common_dir_abs_path, fs)
+                .await
+                .log_err()
+                .flatten()
+        } else {
+            None
+        };
 
         let work_directory_id = work_dir_entry.id;
 
@@ -3672,6 +3715,7 @@ impl BackgroundScannerState {
             dot_git_abs_path,
             common_dir_abs_path,
             repository_dir_abs_path,
+            source_common_dir_abs_path,
         };
 
         self.snapshot
@@ -3702,6 +3746,36 @@ async fn watch_git_dir_subdirectories(git_dir_abs_path: &Path, fs: &dyn Fs, watc
     }
 
     watch_dir_tree(git_dir_abs_path.join(REFS_DIR), fs, watcher).await;
+}
+
+async fn watch_delta_source_inputs(
+    common_dir_abs_path: &Path,
+    fs: &dyn Fs,
+    watcher: &dyn Watcher,
+) -> Result<()> {
+    if !may_be_delta_clone(common_dir_abs_path) {
+        return Ok(());
+    }
+    let mut result = Ok(());
+    for input_path in [OBJECTS_ALTERNATES, DELTA_CHECKOUT_MARKER] {
+        let mut input_dir_abs_path = common_dir_abs_path.to_path_buf();
+        for component in Path::new(input_path)
+            .parent()
+            .into_iter()
+            .flat_map(Path::components)
+        {
+            input_dir_abs_path.push(component);
+            if !fs.is_dir(&input_dir_abs_path).await {
+                break;
+            }
+            result = result.and(
+                watcher
+                    .add(&input_dir_abs_path)
+                    .context("failed to add checkout source directory to watcher"),
+            );
+        }
+    }
+    result
 }
 
 /// Watches a directory and all of its descendant directories.
@@ -4596,6 +4670,10 @@ impl BackgroundScanner {
             .await;
         }
 
+        if self.defer_watch {
+            self.refresh_source_common_dirs().await;
+        }
+
         // Continue processing events until the worktree is dropped.
         self.phase = BackgroundScannerPhase::Events;
 
@@ -4947,9 +5025,16 @@ impl BackgroundScanner {
                         && path_in_git_dir != Path::new(LOGS_REF_STASH))
                         || (path_in_git_dir.starts_with(INFO_DIR)
                             && path_in_git_dir != Path::new(REPO_EXCLUDE))
-                        || skipped_dirs_in_dot_git.iter().any(|skipped_git_subdir| {
+                        || (skipped_dirs_in_dot_git.iter().any(|skipped_git_subdir| {
                             path_in_git_dir.starts_with(skipped_git_subdir)
-                        })
+                        }) && !delta_source_input_changed(
+                            snapshot,
+                            &dot_git_abs_path,
+                            &path_in_git_dir,
+                            self.fs.as_ref(),
+                            self.watcher.as_ref(),
+                        )
+                        .await)
                         || path_in_git_dir.extension().is_some_and(|ext| ext == "lock")
                         || (path_in_git_dir.components().count() == 1
                             && path_in_git_dir
@@ -6181,6 +6266,42 @@ impl BackgroundScanner {
         state.snapshot.entries_by_id.edit(entries_by_id_edits, ());
     }
 
+    async fn refresh_source_common_dirs(&self) {
+        let mut state = self.state.lock().await;
+        let Some((work_directory_id, common_dir_abs_path, known_source_common_dir_abs_path)) =
+            state
+                .snapshot
+                .local_repo_for_work_directory_path(RelPath::empty())
+                .map(|repository| {
+                    (
+                        repository.work_directory_id,
+                        repository.common_dir_abs_path.clone(),
+                        repository.source_common_dir_abs_path.clone(),
+                    )
+                })
+        else {
+            return;
+        };
+        let Some(source_common_dir_abs_path) = discover_new_delta_source_common_dir(
+            &common_dir_abs_path,
+            known_source_common_dir_abs_path.as_ref(),
+            self.fs.as_ref(),
+            self.watcher.as_ref(),
+        )
+        .await
+        else {
+            return;
+        };
+        state
+            .snapshot
+            .git_repositories
+            .update(&work_directory_id, |entry| {
+                entry.source_common_dir_abs_path = Some(source_common_dir_abs_path);
+            });
+        drop(state);
+        self.send_status_update(false, SmallVec::new(), &[]).await;
+    }
+
     async fn update_git_repositories(&self, dot_git_paths: Vec<PathBuf>) -> Vec<Arc<Path>> {
         log::trace!("reloading repositories: {dot_git_paths:?}");
         let mut state = self.state.lock().await;
@@ -6230,11 +6351,37 @@ impl BackgroundScanner {
                     .await;
             } else {
                 for work_directory_id in existing_work_directory_ids {
+                    let root_repository = state
+                        .snapshot
+                        .git_repositories
+                        .get(&work_directory_id)
+                        .filter(|entry| entry.work_directory.path_key().0.is_empty())
+                        .map(|entry| {
+                            (
+                                entry.common_dir_abs_path.clone(),
+                                entry.source_common_dir_abs_path.clone(),
+                            )
+                        });
+                    let source_common_dir_abs_path = match root_repository {
+                        Some((common_dir_abs_path, known_source_common_dir_abs_path)) => {
+                            discover_new_delta_source_common_dir(
+                                &common_dir_abs_path,
+                                known_source_common_dir_abs_path.as_ref(),
+                                self.fs.as_ref(),
+                                self.watcher.as_ref(),
+                            )
+                            .await
+                        }
+                        None => None,
+                    };
                     state
                         .snapshot
                         .git_repositories
                         .update(&work_directory_id, |entry| {
                             entry.git_dir_scan_id = scan_id;
+                            if source_common_dir_abs_path.is_some() {
+                                entry.source_common_dir_abs_path = source_common_dir_abs_path;
+                            }
                         });
                 }
             }
@@ -7211,24 +7358,232 @@ fn resolve_commondir_path(repository_dir_abs_path: &Path, commondir_path: &str) 
     }
 }
 
-pub async fn discover_root_repo_common_dir(root_abs_path: &Path, fs: &dyn Fs) -> Option<Arc<Path>> {
+pub async fn discover_root_repo_group_common_dir(
+    root_abs_path: &Path,
+    fs: &dyn Fs,
+) -> Option<Arc<Path>> {
     discover_root_repo_metadata(root_abs_path, fs)
         .await
-        .map(|(common_dir, _)| common_dir)
+        .map(|metadata| metadata.source_common_dir.unwrap_or(metadata.common_dir))
+}
+
+pub async fn discover_root_repo_source_common_dir(
+    root_abs_path: &Path,
+    fs: &dyn Fs,
+) -> Option<Arc<Path>> {
+    let dot_git_abs_path = root_abs_path.join(DOT_GIT);
+    let gitfile_contents = fs.load(&dot_git_abs_path).await.ok()?;
+    let repository_dir_abs_path =
+        resolve_gitfile_path(&dot_git_abs_path, parse_gitfile(&gitfile_contents).ok()?);
+    fs.canonicalize(&repository_dir_abs_path).await.ok()?;
+    discover_root_repo_metadata(root_abs_path, fs)
+        .await?
+        .source_common_dir
+}
+
+/// Returns true if `git_dir` is a Git submodule's git directory.
+///
+/// Submodules store their git directory inside the superproject at
+/// `<superproject>/.git/modules/<name>`. Unlike a linked worktree, a submodule
+/// is an independent project whose identity is its own working directory, so its
+/// path must not be resolved to the superproject's `.git/modules/...` directory
+/// (from which the working directory cannot be derived).
+pub fn is_submodule_git_dir(git_dir: &Path) -> bool {
+    let mut previous_was_git_dir = false;
+    for component in git_dir.components() {
+        if let std::path::Component::Normal(name) = component {
+            if previous_was_git_dir && name == std::ffi::OsStr::new("modules") {
+                return true;
+            }
+            previous_was_git_dir = name.to_string_lossy().ends_with(".git");
+        } else {
+            previous_was_git_dir = false;
+        }
+    }
+    false
+}
+
+async fn discover_delta_source_common_dir(
+    common_dir_abs_path: &Path,
+    fs: &dyn Fs,
+) -> Result<Option<Arc<Path>>> {
+    read_delta_source_common_dir(common_dir_abs_path, fs)
+        .await
+        .with_context(|| format!("discovering the Delta source of {common_dir_abs_path:?}"))
+}
+
+async fn read_delta_source_common_dir(
+    common_dir_abs_path: &Path,
+    fs: &dyn Fs,
+) -> Result<Option<Arc<Path>>> {
+    if !is_delta_clone(common_dir_abs_path, fs).await? {
+        return Ok(None);
+    }
+    let alternates_abs_path = common_dir_abs_path.join(OBJECTS_ALTERNATES);
+    let Some(alternates) = load_bytes_if_exists(&alternates_abs_path, fs).await? else {
+        return Ok(None);
+    };
+    let first_alternate = alternates
+        .split(|byte| *byte == b'\n')
+        .next()
+        .unwrap_or_default();
+    let Some(source_common_dir) = std::str::from_utf8(first_alternate)
+        .inspect_err(|error| {
+            log::debug!("ignoring the first alternate in {alternates_abs_path:?}: {error}")
+        })
+        .ok()
+        .and_then(|first_alternate| {
+            alternate_source_common_dir(first_alternate.trim_end_matches('\r'))
+        })
+    else {
+        return Ok(None);
+    };
+    let source_common_dir = canonicalize_existing_prefix(source_common_dir, fs).await?;
+    if is_submodule_git_dir(&source_common_dir) || is_delta_clone(&source_common_dir, fs).await? {
+        return Ok(None);
+    }
+    Ok(Some(Arc::from(source_common_dir)))
+}
+
+struct RootRepoMetadata {
+    common_dir: Arc<Path>,
+    is_linked_worktree: bool,
+    source_common_dir: Option<Arc<Path>>,
 }
 
 async fn discover_root_repo_metadata(
     root_abs_path: &Path,
     fs: &dyn Fs,
-) -> Option<(Arc<Path>, bool)> {
+) -> Option<RootRepoMetadata> {
     let root_dot_git = root_abs_path.join(DOT_GIT);
     if !fs.metadata(&root_dot_git).await.is_ok_and(|m| m.is_some()) {
         return None;
     }
     let dot_git_path: Arc<Path> = root_dot_git.into();
     let (repository_dir, common_dir) = discover_git_paths(&dot_git_path, fs).await;
-    let is_linked_worktree = repository_dir != common_dir;
-    Some((common_dir, is_linked_worktree))
+    let source_common_dir = discover_delta_source_common_dir(&common_dir, fs)
+        .await
+        .log_err()
+        .flatten();
+    Some(RootRepoMetadata {
+        is_linked_worktree: repository_dir != common_dir,
+        common_dir,
+        source_common_dir,
+    })
+}
+
+const DELTA_CHECKOUT_MARKER: &str = "delta/copy-baseline";
+const OBJECTS_ALTERNATES: &str = "objects/info/alternates";
+
+async fn delta_source_input_changed(
+    snapshot: &LocalSnapshot,
+    common_dir_abs_path: &Path,
+    path_in_git_dir: &Path,
+    fs: &dyn Fs,
+    watcher: &dyn Watcher,
+) -> bool {
+    if !may_be_delta_clone(common_dir_abs_path)
+        || !Path::new(OBJECTS_ALTERNATES)
+            .ancestors()
+            .any(|input_path| input_path == path_in_git_dir)
+    {
+        return false;
+    }
+    let Some(root_repository) = snapshot
+        .local_repo_for_work_directory_path(RelPath::empty())
+        .filter(|repository| {
+            SanitizedPath::new(repository.common_dir_abs_path.as_ref())
+                == SanitizedPath::new(common_dir_abs_path)
+        })
+    else {
+        return false;
+    };
+    discover_new_delta_source_common_dir(
+        common_dir_abs_path,
+        root_repository.source_common_dir_abs_path.as_ref(),
+        fs,
+        watcher,
+    )
+    .await
+    .is_some()
+}
+
+async fn discover_new_delta_source_common_dir(
+    common_dir_abs_path: &Path,
+    known_source_common_dir_abs_path: Option<&Arc<Path>>,
+    fs: &dyn Fs,
+    watcher: &dyn Watcher,
+) -> Option<Arc<Path>> {
+    if let Err(error) = watch_delta_source_inputs(common_dir_abs_path, fs, watcher).await {
+        log::debug!("{error:#}");
+    }
+    match discover_delta_source_common_dir(common_dir_abs_path, fs).await {
+        Ok(source_common_dir_abs_path) => {
+            source_common_dir_abs_path.filter(|source_common_dir_abs_path| {
+                Some(source_common_dir_abs_path) != known_source_common_dir_abs_path
+            })
+        }
+        Err(error) => {
+            log::debug!("{error:#}");
+            None
+        }
+    }
+}
+
+fn may_be_delta_clone(common_dir_abs_path: &Path) -> bool {
+    common_dir_abs_path.file_name() != Some(OsStr::new(DOT_GIT))
+        && !is_submodule_git_dir(common_dir_abs_path)
+}
+
+async fn is_delta_clone(common_dir_abs_path: &Path, fs: &dyn Fs) -> Result<bool> {
+    Ok(may_be_delta_clone(common_dir_abs_path)
+        && fs
+            .metadata(&common_dir_abs_path.join(DELTA_CHECKOUT_MARKER))
+            .await?
+            .is_some())
+}
+
+fn alternate_source_common_dir(alternate: &str) -> Option<&Path> {
+    let source_objects_dir = Path::new(alternate);
+    if !source_objects_dir.is_absolute()
+        || source_objects_dir.file_name() != Some(OsStr::new(OBJECTS_DIR))
+    {
+        return None;
+    }
+    source_objects_dir.parent()
+}
+
+async fn canonicalize_existing_prefix(abs_path: &Path, fs: &dyn Fs) -> Result<PathBuf> {
+    for ancestor in abs_path.ancestors() {
+        if fs.metadata(ancestor).await?.is_none() {
+            continue;
+        }
+        let canonical_ancestor = fs.canonicalize(ancestor).await?;
+        return Ok(match abs_path.strip_prefix(ancestor) {
+            Ok(suffix) if !suffix.as_os_str().is_empty() => canonical_ancestor.join(suffix),
+            _ => canonical_ancestor,
+        });
+    }
+    Ok(abs_path.to_path_buf())
+}
+
+async fn load_bytes_if_exists(abs_path: &Path, fs: &dyn Fs) -> Result<Option<Vec<u8>>> {
+    match fs.load_bytes(abs_path).await {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error)
+            if error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound
+                        | std::io::ErrorKind::NotADirectory
+                        | std::io::ErrorKind::IsADirectory
+                )
+            }) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 async fn discover_git_paths(dot_git_abs_path: &Arc<Path>, fs: &dyn Fs) -> (Arc<Path>, Arc<Path>) {
@@ -7440,7 +7795,8 @@ mod tests {
     use super::{
         BackgroundScanner, BackgroundScannerPhase, BackgroundScannerState, IgnoreStack,
         NullWatcher, RemovedEntries, STREAM_BLOCK_BYTES, ScanRequest, UpdateIgnoreStatusJob,
-        Worktree, stream_utf8_into_rope,
+        Worktree, alternate_source_common_dir, discover_delta_source_common_dir,
+        stream_utf8_into_rope, watch_delta_source_inputs,
     };
     use collections::{HashMap, HashSet};
     use fs::{FakeFs, Fs, RemoveOptions, RenameOptions};
@@ -7449,7 +7805,10 @@ mod tests {
     use serde_json::json;
     use settings::{SettingsStore, WorktreeId};
     use smallvec::SmallVec;
-    use std::{path::Path, sync::Arc};
+    use std::{
+        path::{Path, PathBuf},
+        sync::Arc,
+    };
     use text::LineEnding;
     use util::{path, rel_path::rel_path};
 
@@ -7725,5 +8084,178 @@ mod tests {
         assert_eq!(stream(b"hello \xff\xfeA").await, None, "invalid utf-8");
         assert_eq!(stream(b"hello \xe2\x82").await, None, "truncated at eof");
         assert_eq!(stream(b"plain \x1b$B text").await, None, "iso-2022 escape");
+    }
+
+    #[gpui::test]
+    async fn test_watch_delta_source_inputs(cx: &mut TestAppContext) {
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                "clone.git": {
+                    "delta": { "copy-baseline": "" },
+                    "objects": { "info": { "alternates": "" } },
+                },
+                "new-clone.git": { "objects": {} },
+                "repo": { ".git": { "delta": {}, "objects": { "info": {} } } },
+            }),
+        )
+        .await;
+        let mut watched_paths = Vec::new();
+        for common_dir in [
+            path!("/root/clone.git"),
+            path!("/root/new-clone.git"),
+            path!("/root/repo/.git"),
+        ] {
+            let watcher = RecordingWatcher::default();
+            watch_delta_source_inputs(Path::new(common_dir), fs.as_ref(), &watcher)
+                .await
+                .unwrap();
+            watched_paths.push(watcher.added_paths.lock().clone());
+        }
+
+        let failing_watcher = RecordingWatcher {
+            failing_path: Some(PathBuf::from(path!("/root/clone.git/objects"))),
+            ..RecordingWatcher::default()
+        };
+        let failing_watcher_result = watch_delta_source_inputs(
+            Path::new(path!("/root/clone.git")),
+            fs.as_ref(),
+            &failing_watcher,
+        )
+        .await;
+        watched_paths.push(failing_watcher.added_paths.lock().clone());
+
+        let clone_input_dirs = vec![
+            PathBuf::from(path!("/root/clone.git/objects")),
+            PathBuf::from(path!("/root/clone.git/objects/info")),
+            PathBuf::from(path!("/root/clone.git/delta")),
+        ];
+        assert_eq!(
+            (watched_paths, failing_watcher_result.is_err()),
+            (
+                vec![
+                    clone_input_dirs.clone(),
+                    vec![PathBuf::from(path!("/root/new-clone.git/objects"))],
+                    Vec::new(),
+                    clone_input_dirs,
+                ],
+                true
+            )
+        );
+    }
+
+    #[gpui::test]
+    async fn test_discover_delta_source_common_dir(cx: &mut TestAppContext) {
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                "repo": { ".git": { "objects": {} } },
+                "first-line.git": { "delta": { "copy-baseline": "" }, "objects": { "info": {} } },
+                "crlf.git": { "delta": { "copy-baseline": "" }, "objects": { "info": {} } },
+                "undecodable.git": { "delta": { "copy-baseline": "" }, "objects": { "info": {} } },
+                "unmarked.git": { "objects": { "info": {} } },
+            }),
+        )
+        .await;
+        let objects_dir = path!("/root/repo/.git/objects");
+        for (clone_name, alternates) in [
+            (
+                "first-line.git",
+                [objects_dir.as_bytes(), b"\n\xff\xfe\n"].concat(),
+            ),
+            ("crlf.git", [objects_dir.as_bytes(), b"\r\n"].concat()),
+            (
+                "undecodable.git",
+                [b"\xff\xfe\n", objects_dir.as_bytes(), b"\n"].concat(),
+            ),
+            ("unmarked.git", [objects_dir.as_bytes(), b"\n"].concat()),
+        ] {
+            fs.insert_file(
+                Path::new(path!("/root"))
+                    .join(clone_name)
+                    .join("objects/info/alternates"),
+                alternates,
+            )
+            .await;
+        }
+
+        let mut source_common_dirs = Vec::new();
+        for clone_name in [
+            "first-line.git",
+            "crlf.git",
+            "undecodable.git",
+            "unmarked.git",
+        ] {
+            source_common_dirs.push(
+                discover_delta_source_common_dir(
+                    &Path::new(path!("/root")).join(clone_name),
+                    fs.as_ref(),
+                )
+                .await
+                .unwrap()
+                .map(|source_common_dir| source_common_dir.to_path_buf()),
+            );
+        }
+        assert_eq!(
+            source_common_dirs,
+            [
+                Some(PathBuf::from(path!("/root/repo/.git"))),
+                Some(PathBuf::from(path!("/root/repo/.git"))),
+                None,
+                None,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_alternate_source_common_dir() {
+        let objects_dir = path!("/repo/.git/objects");
+        let alternates = [
+            objects_dir.to_string(),
+            String::new(),
+            format!(" {objects_dir}"),
+            format!("#{objects_dir}"),
+            format!("\"{objects_dir}\""),
+            "../repo/.git/objects".to_string(),
+            path!("/repo/.git/pack").to_string(),
+        ];
+        assert_eq!(
+            alternates
+                .iter()
+                .map(|alternate| alternate_source_common_dir(alternate))
+                .collect::<Vec<_>>(),
+            [
+                Some(Path::new(path!("/repo/.git"))),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None
+            ]
+        );
+    }
+
+    #[derive(Default)]
+    struct RecordingWatcher {
+        added_paths: parking_lot::Mutex<Vec<PathBuf>>,
+        failing_path: Option<PathBuf>,
+    }
+
+    impl fs::Watcher for RecordingWatcher {
+        fn add(&self, path: &Path) -> anyhow::Result<()> {
+            self.added_paths.lock().push(path.to_path_buf());
+            anyhow::ensure!(
+                self.failing_path.as_deref() != Some(path),
+                "cannot watch {path:?}"
+            );
+            Ok(())
+        }
+
+        fn remove(&self, _: &Path) -> anyhow::Result<()> {
+            Ok(())
+        }
     }
 }

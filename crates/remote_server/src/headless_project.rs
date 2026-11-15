@@ -669,6 +669,9 @@ impl HeadlessProject {
                     .root_repo_common_dir()
                     .map(|p| p.to_string_lossy().into_owned()),
                 root_repo_is_linked_worktree: worktree.root_repo_is_linked_worktree(),
+                root_repo_source_common_dir: worktree
+                    .root_repo_source_common_dir()
+                    .map(|path| path.to_string_lossy().into_owned()),
             }
         });
 

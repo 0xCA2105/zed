@@ -527,6 +527,7 @@ impl RejoinedProject {
                     root_repo_common_dir: None,
                     // todo(collab): Get this field from database
                     root_repo_is_linked_worktree: false,
+                    root_repo_source_common_dir: None,
                 })
                 .collect(),
             collaborators: self

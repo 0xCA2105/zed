@@ -1625,6 +1625,7 @@ fn notify_rejoined_projects(
                 root_repo_common_dir: worktree.root_repo_common_dir,
                 // todo(collab): Get this field from database
                 root_repo_is_linked_worktree: false,
+                root_repo_source_common_dir: None,
                 updated_entries: worktree.updated_entries,
                 removed_entries: worktree.removed_entries,
                 scan_id: worktree.scan_id,
@@ -2035,6 +2036,7 @@ async fn join_project(
             root_repo_common_dir: None,
             // todo(collab): Get this field from database
             root_repo_is_linked_worktree: false,
+            root_repo_source_common_dir: None,
         })
         .collect::<Vec<_>>();
 
@@ -2089,6 +2091,7 @@ async fn join_project(
             root_repo_common_dir: worktree.root_repo_common_dir,
             // todo(collab): Get this field from database
             root_repo_is_linked_worktree: false,
+            root_repo_source_common_dir: None,
             updated_entries: worktree.entries,
             removed_entries: Default::default(),
             scan_id: worktree.scan_id,

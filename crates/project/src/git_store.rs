@@ -73,6 +73,7 @@ use smol::future::yield_now;
 use std::{
     cmp::Ordering,
     collections::{BTreeSet, HashSet, VecDeque, hash_map::Entry},
+    ffi::OsStr,
     future::Future,
     mem,
     ops::Range,
@@ -93,6 +94,7 @@ use util::{
     post_inc,
     rel_path::RelPath,
 };
+pub use worktree::is_submodule_git_dir;
 use worktree::{
     File, PathChange, PathKey, PathProgress, PathSummary, PathTarget, ProjectEntryId,
     UpdatedGitRepositoriesSet, UpdatedGitRepository, Worktree, WorktreeSettings,
@@ -10916,28 +10918,6 @@ pub fn repo_identity_path(common_dir: &Path, path_style: PathStyle) -> &Path {
     }
 }
 
-/// Returns true if `git_dir` is a Git submodule's git directory.
-///
-/// Submodules store their git directory inside the superproject at
-/// `<superproject>/.git/modules/<name>`. Unlike a linked worktree, a submodule
-/// is an independent project whose identity is its own working directory, so its
-/// path must not be resolved to the superproject's `.git/modules/...` directory
-/// (from which the working directory cannot be derived).
-pub fn is_submodule_git_dir(git_dir: &Path) -> bool {
-    let mut previous_was_git_dir = false;
-    for component in git_dir.components() {
-        if let std::path::Component::Normal(name) = component {
-            if previous_was_git_dir && name == std::ffi::OsStr::new("modules") {
-                return true;
-            }
-            previous_was_git_dir = name.to_string_lossy().ends_with(".git");
-        } else {
-            previous_was_git_dir = false;
-        }
-    }
-    false
-}
-
 /// Returns a short name for a linked worktree suitable for UI display
 ///
 /// Uses the main worktree path to come up with a short name that disambiguates
@@ -10953,13 +10933,29 @@ pub fn linked_worktree_short_name(
 
     let project_name = path_style.file_name(main_worktree_path)?.to_str()?;
     let directory_name = path_style.file_name(linked_worktree_path)?.to_str()?;
-    let name = if directory_name != project_name {
+    let name = if directory_name != project_name
+        && !is_delta_checkout_path(linked_worktree_path, path_style)
+    {
         directory_name.to_string()
     } else {
         let parent = path_style.parent(linked_worktree_path)?;
         path_style.file_name(parent)?.to_str()?.to_string()
     };
     Some(name.into())
+}
+
+fn is_delta_checkout_path(checkout_path: &Path, path_style: PathStyle) -> bool {
+    let Some(worktrees_directory) = path_style
+        .parent(checkout_path)
+        .and_then(|checkout_id_directory| path_style.parent(checkout_id_directory))
+    else {
+        return false;
+    };
+    path_style.file_name(worktrees_directory) == Some(OsStr::new("worktrees"))
+        && path_style
+            .parent(worktrees_directory)
+            .and_then(|delta_directory| path_style.file_name(delta_directory))
+            == Some(OsStr::new(".delta"))
 }
 
 fn get_permalink_in_rust_registry_src(

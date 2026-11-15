@@ -2912,11 +2912,16 @@ impl RecentWorkspace {
 
 async fn resolve_local_workspace_identity(fs: &dyn Fs, paths: &PathList) -> Option<PathList> {
     let raw_paths = paths.paths();
-    let resolved_paths = futures::future::join_all(
-        raw_paths
-            .iter()
-            .map(|path| project::git_store::resolve_git_worktree_to_main_repo(fs, path)),
-    )
+    let resolved_paths = futures::future::join_all(raw_paths.iter().map(|path| async move {
+        if let Some(source_common_dir) =
+            project::discover_root_repo_source_common_dir(path, fs).await
+        {
+            return Some(
+                project::repo_identity_path(&source_common_dir, PathStyle::local()).to_path_buf(),
+            );
+        }
+        project::git_store::resolve_git_worktree_to_main_repo(fs, path).await
+    }))
     .await;
 
     if resolved_paths.iter().all(|resolved| resolved.is_none()) {
@@ -4613,6 +4618,91 @@ mod tests {
             path_style: Some(PathStyle::local()),
             timestamp,
         }
+    }
+
+    #[gpui::test]
+    async fn test_resolve_local_workspace_identity_for_delta_checkout(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                "repo": {
+                    ".git": { "HEAD": "ref: refs/heads/main\n" },
+                    ".delta": {
+                        "clones": {
+                            "abc": {
+                                "repo.git": {
+                                    "HEAD": "ref: refs/heads/feature\n",
+                                    "worktrees": { "linked": { "commondir": "../.." } },
+                                    "delta": { "copy-baseline": "" },
+                                    "objects": {
+                                        "info": {
+                                            "alternates": format!(
+                                                "{}\n",
+                                                path!("/root/repo/.git/objects")
+                                            ),
+                                        },
+                                    },
+                                },
+                            },
+                        },
+                        "worktrees": {
+                            "abc": {
+                                "repo": {
+                                    ".git": "gitdir: ../../../clones/abc/repo.git\n",
+                                },
+                            },
+                        },
+                    },
+                },
+                "other": {
+                    ".git": {
+                        "HEAD": "ref: refs/heads/main\n",
+                        "worktrees": { "linked": { "commondir": "../.." } },
+                    },
+                },
+                "linked": {
+                    ".git": format!("gitdir: {}\n", path!("/root/other/.git/worktrees/linked")),
+                },
+                "checkout-linked": {
+                    ".git": format!(
+                        "gitdir: {}\n",
+                        path!("/root/repo/.delta/clones/abc/repo.git/worktrees/linked")
+                    ),
+                },
+            }),
+        )
+        .await;
+        let checkout_path = Path::new(path!("/root/repo/.delta/worktrees/abc/repo"));
+        let linked_path = Path::new(path!("/root/linked"));
+        let checkout_linked_path = Path::new(path!("/root/checkout-linked"));
+
+        assert_eq!(
+            (
+                resolve_local_workspace_identity(fs.as_ref(), &PathList::new(&[checkout_path]))
+                    .await,
+                resolve_local_workspace_identity(
+                    fs.as_ref(),
+                    &PathList::new(&[checkout_linked_path])
+                )
+                .await,
+                resolve_local_workspace_identity(
+                    fs.as_ref(),
+                    &PathList::new(&[checkout_path, linked_path])
+                )
+                .await,
+            ),
+            (
+                Some(PathList::new(&[Path::new(path!("/root/repo"))])),
+                Some(PathList::new(&[Path::new(path!("/root/repo"))])),
+                Some(PathList::new(&[
+                    Path::new(path!("/root/repo")),
+                    Path::new(path!("/root/other")),
+                ])),
+            )
+        );
     }
 
     #[gpui::test]

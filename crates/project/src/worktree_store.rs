@@ -119,8 +119,16 @@ impl WorktreePaths {
             .ordered_pairs()
             .map(|(m, f)| (m.clone(), f.clone()))
             .unzip();
-        mains.push(main_path.to_path_buf());
-        folders.push(folder_path.to_path_buf());
+        if let Some((main, _)) = mains
+            .iter_mut()
+            .zip(&folders)
+            .find(|(_, folder)| folder.as_path() == folder_path)
+        {
+            *main = main_path.to_path_buf();
+        } else {
+            mains.push(main_path.to_path_buf());
+            folders.push(folder_path.to_path_buf());
+        }
         self.main_paths = PathList::new(&mains);
         self.paths = PathList::new(&folders);
     }
@@ -908,6 +916,7 @@ impl WorktreeStore {
                         abs_path: response.canonicalized_path,
                         root_repo_common_dir: response.root_repo_common_dir,
                         root_repo_is_linked_worktree: response.root_repo_is_linked_worktree,
+                        root_repo_source_common_dir: response.root_repo_source_common_dir,
                     },
                     client,
                     path_style,
@@ -1247,6 +1256,9 @@ impl WorktreeStore {
                         .root_repo_common_dir()
                         .map(|p| p.to_string_lossy().into_owned()),
                     root_repo_is_linked_worktree: worktree.root_repo_is_linked_worktree(),
+                    root_repo_source_common_dir: worktree
+                        .root_repo_source_common_dir()
+                        .map(|path| path.to_string_lossy().into_owned()),
                 }
             })
             .collect()
@@ -1490,7 +1502,15 @@ impl WorktreeStore {
         }
     }
 
-    pub fn paths(&self, cx: &App) -> WorktreePaths {
+    pub(crate) fn paths(&self, cx: &App) -> WorktreePaths {
+        self.worktree_paths(true, cx)
+    }
+
+    pub(crate) fn git_paths(&self, cx: &App) -> WorktreePaths {
+        self.worktree_paths(false, cx)
+    }
+
+    fn worktree_paths(&self, group_by_source: bool, cx: &App) -> WorktreePaths {
         let (mains, folders): (Vec<PathBuf>, Vec<PathBuf>) = self
             .visible_worktrees(cx)
             .map(|worktree| {
@@ -1504,6 +1524,17 @@ impl WorktreeStore {
                         snapshot.root_repo_is_linked_worktree()
                             || *repo_path == folder_path.as_path()
                             || !folder_path.starts_with(*repo_path)
+                    })
+                    .map(|repo_path| {
+                        snapshot
+                            .root_repo_source_common_dir()
+                            .filter(|_| group_by_source)
+                            .map_or(repo_path, |source_common_dir| {
+                                crate::git_store::repo_identity_path(
+                                    source_common_dir,
+                                    snapshot.path_style(),
+                                )
+                            })
                     })
                     .map(Path::to_path_buf)
                     .unwrap_or_else(|| folder_path.clone());

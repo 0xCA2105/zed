@@ -19,7 +19,7 @@ use editor::{
     code_context_menus::CodeContextMenu,
 };
 use extension::ExtensionHostProxy;
-use fs::{FakeFs, Fs};
+use fs::{FakeFs, Fs, RemoveOptions};
 use futures::FutureExt as _;
 use git::{
     Oid,
@@ -4202,6 +4202,119 @@ async fn test_remote_root_repo_common_dir(cx: &mut TestAppContext, server_cx: &m
     });
     assert_eq!(common_dir, None);
     assert!(!is_linked_worktree);
+}
+
+#[gpui::test]
+async fn test_remote_delta_checkout_follows_its_source(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    let fs = FakeFs::new(server_cx.executor());
+    fs.insert_tree(
+        "/repo",
+        json!({
+            ".git": { "HEAD": "ref: refs/heads/main\n" },
+            ".delta": {
+                "clones": {
+                    "abc": {
+                        "repo.git": {
+                            "HEAD": "ref: refs/heads/feature\n",
+                            "config": "[core]\n\tbare = false\n",
+                            "delta": { "copy-baseline": "" },
+                            "objects": { "info": { "alternates": "/repo/.git/objects\n" } },
+                        },
+                    },
+                },
+                "worktrees": {
+                    "abc": {
+                        "repo": {
+                            ".git": "gitdir: /repo/.delta/clones/abc/repo.git\n",
+                            "file.txt": "content",
+                        },
+                    },
+                },
+            },
+        }),
+    )
+    .await;
+
+    for repository_path in ["/other", "/third"] {
+        fs.insert_tree(
+            repository_path,
+            json!({ ".git": { "HEAD": "ref: refs/heads/main\n" } }),
+        )
+        .await;
+    }
+
+    let (project, _headless) = init_test(&fs, cx, server_cx).await;
+    project
+        .update(cx, |project, cx| {
+            project.find_or_create_worktree("/repo/.delta/worktrees/abc/repo", true, cx)
+        })
+        .await
+        .unwrap();
+    cx.executor().run_until_parked();
+    let group_main_paths = |cx: &mut TestAppContext| {
+        project.read_with(cx, |project, cx| {
+            project
+                .worktree_paths(cx)
+                .main_worktree_path_list()
+                .paths()
+                .to_vec()
+        })
+    };
+    let main_paths_with_source = group_main_paths(cx);
+    let changed_main_paths = Rc::new(RefCell::new(Vec::new()));
+    cx.update(|cx| {
+        cx.subscribe(&project, {
+            let changed_main_paths = changed_main_paths.clone();
+            move |_, event, _| {
+                if let project::Event::WorktreePathsChanged { old_worktree_paths } = event {
+                    changed_main_paths.borrow_mut().push(
+                        old_worktree_paths
+                            .main_worktree_path_list()
+                            .paths()
+                            .to_vec(),
+                    );
+                }
+            }
+        })
+        .detach();
+    });
+
+    let alternates = Path::new("/repo/.delta/clones/abc/repo.git/objects/info/alternates");
+    fs.insert_file(alternates, b"/other/.git/objects\n".to_vec())
+        .await;
+    cx.executor().run_until_parked();
+    let main_paths_with_other_source = group_main_paths(cx);
+
+    let dot_git = Path::new("/repo/.delta/worktrees/abc/repo/.git");
+    fs.remove_file(dot_git, RemoveOptions::default())
+        .await
+        .unwrap();
+    cx.executor().run_until_parked();
+    fs.insert_file(dot_git, b"gitdir: /third/.git\n".to_vec())
+        .await;
+    cx.executor().run_until_parked();
+
+    assert_eq!(
+        (
+            main_paths_with_source,
+            main_paths_with_other_source,
+            group_main_paths(cx),
+            changed_main_paths.take(),
+        ),
+        (
+            vec![PathBuf::from("/repo")],
+            vec![PathBuf::from("/other")],
+            vec![PathBuf::from("/third")],
+            vec![
+                vec![PathBuf::from("/repo")],
+                vec![PathBuf::from("/other")],
+                vec![PathBuf::from("/repo/.delta/worktrees/abc/repo")],
+            ],
+        )
+    );
 }
 
 #[gpui::test]
