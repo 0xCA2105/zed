@@ -13257,6 +13257,197 @@ async fn test_activating_workspace_with_draft_does_not_create_extras(cx: &mut Te
 }
 
 #[gpui::test]
+async fn test_delta_checkout_upgrades_saved_threads_and_groups(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    let source_path = Path::new(util::path!("/repo"));
+    let clone_path = |id: &str| {
+        Path::new(util::path!("/repo/.delta/clones"))
+            .join(id)
+            .join("repo.git")
+    };
+    let checkout_path = |id: &str| {
+        Path::new(util::path!("/repo/.delta/worktrees"))
+            .join(id)
+            .join("repo")
+    };
+    fs.insert_tree(
+        source_path,
+        serde_json::json!({ ".git": { "HEAD": "ref: refs/heads/main\n" } }),
+    )
+    .await;
+    for id in ["abc", "def", "ghi", "jkl"] {
+        fs.insert_tree(
+            clone_path(id),
+            serde_json::json!({
+                "HEAD": "ref: refs/heads/feature\n",
+                "config": "[core]\n\tbare = false\n",
+                "delta": { "copy-baseline": "" },
+                "objects": {
+                    "info": {
+                        "alternates": format!("{}\n", util::path!("/repo/.git/objects")),
+                    },
+                },
+            }),
+        )
+        .await;
+        fs.insert_tree(
+            checkout_path(id),
+            serde_json::json!({
+                ".git": format!("gitdir: {}\n", clone_path(id).display()),
+                "src": {},
+            }),
+        )
+        .await;
+    }
+    let saved_at = chrono::TimeZone::with_ymd_and_hms(&Utc, 2024, 1, 1, 0, 0, 0).unwrap();
+    for (title, folder_path, main_path) in [
+        ("Checkout", checkout_path("abc"), clone_path("abc")),
+        (
+            "Subfolder",
+            checkout_path("def").join("src"),
+            clone_path("def"),
+        ),
+        (
+            "Clone folder",
+            clone_path("jkl"),
+            PathBuf::from(util::path!("/elsewhere")),
+        ),
+    ] {
+        save_thread_metadata_with_main_paths(
+            title,
+            title,
+            PathList::new(&[folder_path]),
+            PathList::new(&[main_path]),
+            saved_at,
+            cx,
+        );
+    }
+
+    let source_project = project::Project::test(fs.clone(), [source_path], cx).await;
+    let mut other_projects = Vec::new();
+    for root_path in [
+        checkout_path("abc"),
+        checkout_path("def"),
+        checkout_path("ghi"),
+        checkout_path("jkl"),
+        clone_path("ghi"),
+    ] {
+        other_projects.push(project::Project::test(fs.clone(), [root_path.as_path()], cx).await);
+    }
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(source_project, window, cx));
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.retain_active_workspace(cx);
+        for project in other_projects {
+            multi_workspace.test_add_workspace(project, window, cx);
+        }
+        multi_workspace.restore_project_groups(
+            ["abc", "def", "ghi", "jkl"]
+                .into_iter()
+                .map(|id| workspace::SerializedProjectGroupState {
+                    key: ProjectGroupKey::new(None, PathList::new(&[clone_path(id)])),
+                    expanded: true,
+                })
+                .collect(),
+            cx,
+        );
+    });
+    let group_paths = |cx: &mut gpui::VisualTestContext| {
+        multi_workspace.read_with(cx, |multi_workspace, _| {
+            multi_workspace
+                .project_group_keys()
+                .into_iter()
+                .map(|key| key.path_list().paths().to_vec())
+                .collect::<Vec<_>>()
+        })
+    };
+
+    let sidebar = cx.update(|window, cx| {
+        ThreadMetadataStore::init_global(cx);
+        let multi_workspace = multi_workspace.clone();
+        cx.new(|cx| Sidebar::new(multi_workspace, window, cx))
+    });
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.register_sidebar(sidebar.clone(), cx);
+    });
+    sidebar.update(cx, |sidebar, cx| sidebar.update_entries(cx));
+    let group_paths_before_load = group_paths(cx);
+
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.toggle_sidebar(window, cx);
+    });
+    cx.run_until_parked();
+    save_thread_metadata_with_main_paths(
+        "Saved later",
+        "Saved later",
+        PathList::new(&[checkout_path("def")]),
+        PathList::new(&[clone_path("def")]),
+        saved_at,
+        cx,
+    );
+    cx.run_until_parked();
+
+    let mut thread_main_paths = cx.update(|_, cx| {
+        ThreadMetadataStore::global(cx)
+            .read(cx)
+            .entries()
+            .map(|thread| {
+                (
+                    thread.display_title().to_string(),
+                    thread.main_worktree_paths().paths().to_vec(),
+                )
+            })
+            .collect::<Vec<_>>()
+    });
+    thread_main_paths.sort();
+    let mut thread_entries = visible_entries_as_strings(&sidebar, cx)
+        .into_iter()
+        .filter(|entry| entry.starts_with("  "))
+        .collect::<Vec<_>>();
+    thread_entries.sort();
+
+    assert_eq!(
+        (
+            group_paths_before_load,
+            group_paths(cx),
+            thread_main_paths,
+            thread_entries
+        ),
+        (
+            vec![
+                vec![clone_path("abc")],
+                vec![clone_path("def")],
+                vec![clone_path("ghi")],
+                vec![clone_path("jkl")],
+                vec![source_path.to_path_buf()],
+            ],
+            vec![
+                vec![clone_path("def")],
+                vec![clone_path("ghi")],
+                vec![clone_path("jkl")],
+                vec![source_path.to_path_buf()],
+            ],
+            vec![
+                ("Checkout".to_string(), vec![source_path.to_path_buf()]),
+                (
+                    "Clone folder".to_string(),
+                    vec![PathBuf::from(util::path!("/elsewhere"))],
+                ),
+                ("Saved later".to_string(), vec![source_path.to_path_buf()]),
+                ("Subfolder".to_string(), vec![clone_path("def")]),
+            ],
+            vec![
+                "  Checkout {abc}".to_string(),
+                "  Clone folder {repo.git}".to_string(),
+                "  Saved later {def}".to_string(),
+                "  Subfolder {src}".to_string(),
+            ],
+        )
+    );
+}
+
+#[gpui::test]
 async fn test_delta_checkout_groups_with_its_source(cx: &mut TestAppContext) {
     init_test(cx);
     let fs = FakeFs::new(cx.executor());

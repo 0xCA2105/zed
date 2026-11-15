@@ -160,6 +160,7 @@ pub struct TerminalThreadMetadataStore {
     terminals_by_paths: HashMap<PathList, HashSet<TerminalId>>,
     terminals_by_main_paths: HashMap<PathList, HashSet<TerminalId>>,
     reload_task: Option<Shared<Task<()>>>,
+    has_loaded: bool,
     pending_terminal_ops_tx: async_channel::Sender<DbOperation>,
     _db_operations_task: Task<()>,
 }
@@ -220,6 +221,10 @@ impl TerminalThreadMetadataStore {
         self.reload_task
             .clone()
             .unwrap_or_else(|| Task::ready(()).shared())
+    }
+
+    pub fn has_loaded(&self) -> bool {
+        self.has_loaded
     }
 
     pub fn entries_for_path<'a>(
@@ -317,18 +322,22 @@ impl TerminalThreadMetadataStore {
             .copied()
             .collect();
 
-        if terminal_ids.is_empty() {
-            return;
-        }
-
+        let mut changed = false;
         for terminal_id in terminal_ids {
             if let Some(mut terminal) = self.terminals.get(&terminal_id).cloned() {
+                let worktree_paths = terminal.worktree_paths.clone();
                 mutate(&mut terminal.worktree_paths);
+                if terminal.worktree_paths == worktree_paths {
+                    continue;
+                }
+                changed = true;
                 self.save_internal(terminal);
             }
         }
 
-        cx.notify();
+        if changed {
+            cx.notify();
+        }
     }
 
     fn save_internal(&mut self, metadata: TerminalThreadMetadata) {
@@ -421,6 +430,7 @@ impl TerminalThreadMetadataStore {
             terminals_by_paths: HashMap::default(),
             terminals_by_main_paths: HashMap::default(),
             reload_task: None,
+            has_loaded: false,
             pending_terminal_ops_tx: tx,
             _db_operations_task,
         };
@@ -449,15 +459,15 @@ impl TerminalThreadMetadataStore {
                             .context("Failed to fetch terminal thread metadata")
                     })
                     .await
-                    .log_err()
-                    .unwrap_or_default();
+                    .log_err();
 
                 this.update(cx, |this, cx| {
+                    this.has_loaded = rows.is_some();
                     this.terminals.clear();
                     this.terminals_by_paths.clear();
                     this.terminals_by_main_paths.clear();
 
-                    for row in rows {
+                    for row in rows.unwrap_or_default() {
                         this.cache_terminal_metadata(row);
                     }
 
@@ -791,5 +801,25 @@ mod tests {
                 old_main_paths.paths()
             );
         });
+
+        let notification_count = std::rc::Rc::new(std::cell::Cell::new(0));
+        let _subscription = cx.update(|cx| {
+            let notification_count = notification_count.clone();
+            cx.observe(&TerminalThreadMetadataStore::global(cx), move |_, _| {
+                notification_count.set(notification_count.get() + 1);
+            })
+        });
+        cx.update(|cx| {
+            TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                store.change_worktree_paths(
+                    &new_folder_paths,
+                    None,
+                    |paths| paths.add_path(new_main_path, new_folder_path),
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+        assert_eq!(notification_count.get(), 0);
     }
 }

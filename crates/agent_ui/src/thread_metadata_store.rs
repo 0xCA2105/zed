@@ -506,6 +506,7 @@ pub struct ThreadMetadataStore {
     threads_by_main_paths: HashMap<PathList, HashSet<ThreadId>>,
     threads_by_session: HashMap<acp::SessionId, ThreadId>,
     reload_task: Option<Shared<Task<()>>>,
+    has_loaded: bool,
     conversation_subscriptions: HashMap<gpui::EntityId, Subscription>,
     pending_thread_ops_tx: async_channel::Sender<DbOperation>,
     in_flight_archives: HashMap<ThreadId, (Task<()>, async_channel::Sender<()>)>,
@@ -609,6 +610,10 @@ impl ThreadMetadataStore {
             .unwrap_or_else(|| Task::ready(()).shared())
     }
 
+    pub fn has_loaded(&self) -> bool {
+        self.has_loaded
+    }
+
     /// Returns all archived threads.
     pub fn archived_entries(&self) -> impl Iterator<Item = &ThreadMetadata> + '_ {
         self.entries().filter(|t| t.archived)
@@ -678,6 +683,7 @@ impl ThreadMetadataStore {
                     for row in rows {
                         this.cache_thread_metadata(row);
                     }
+                    this.has_loaded = true;
 
                     cx.notify();
                 })
@@ -1010,8 +1016,16 @@ impl ThreadMetadataStore {
             return;
         }
 
+        let mut changed = false;
         for thread_id in thread_ids {
             if let Some(thread) = self.threads.get_mut(thread_id) {
+                let mut worktree_paths = thread.worktree_paths.clone();
+                mutate(&mut worktree_paths);
+                if worktree_paths == thread.worktree_paths {
+                    continue;
+                }
+                changed = true;
+
                 if let Some(ids) = self
                     .threads_by_main_paths
                     .get_mut(thread.main_worktree_paths())
@@ -1022,7 +1036,7 @@ impl ThreadMetadataStore {
                     ids.remove(thread_id);
                 }
 
-                mutate(&mut thread.worktree_paths);
+                thread.worktree_paths = worktree_paths;
 
                 self.threads_by_main_paths
                     .entry(thread.main_worktree_paths().clone())
@@ -1039,7 +1053,9 @@ impl ThreadMetadataStore {
             }
         }
 
-        cx.notify();
+        if changed {
+            cx.notify();
+        }
     }
 
     pub fn create_archived_worktree(
@@ -1240,6 +1256,7 @@ impl ThreadMetadataStore {
             threads_by_main_paths: HashMap::default(),
             threads_by_session: HashMap::default(),
             reload_task: None,
+            has_loaded: false,
             conversation_subscriptions: HashMap::default(),
             pending_thread_ops_tx: tx,
             in_flight_archives: HashMap::default(),
@@ -3714,6 +3731,54 @@ mod tests {
         assert!(paths.contains(&PathBuf::from("/new/worktree-a")));
         assert!(paths.contains(&PathBuf::from("/other/path")));
         assert!(!paths.contains(&PathBuf::from("/should/not/appear")));
+    }
+
+    #[gpui::test]
+    async fn test_change_worktree_paths_skips_unchanged_threads(cx: &mut TestAppContext) {
+        init_test(cx);
+        let store = cx.update(|cx| ThreadMetadataStore::global(cx));
+        let folder_paths = PathList::new(&[Path::new("/projects/checkout")]);
+        let metadata = make_metadata("session", "Thread", Utc::now(), folder_paths.clone());
+        let thread_id = metadata.thread_id;
+        store.update(cx, |store, cx| {
+            store.save(metadata, cx);
+        });
+        cx.run_until_parked();
+
+        let notification_count = Rc::new(std::cell::Cell::new(0));
+        let _subscription = cx.update(|cx| {
+            let notification_count = notification_count.clone();
+            cx.observe(&store, move |_, _| {
+                notification_count.set(notification_count.get() + 1);
+            })
+        });
+        let mut main_paths = Vec::new();
+        for _ in 0..2 {
+            store.update(cx, |store, cx| {
+                store.change_worktree_paths(
+                    &folder_paths,
+                    None,
+                    |paths| {
+                        paths.add_path(
+                            Path::new("/projects/source"),
+                            Path::new("/projects/checkout"),
+                        )
+                    },
+                    cx,
+                );
+            });
+            cx.run_until_parked();
+            main_paths.push(store.read_with(cx, |store, _| {
+                store
+                    .entry(thread_id)
+                    .map(|thread| thread.main_worktree_paths().paths().to_vec())
+            }));
+        }
+
+        assert_eq!(
+            (main_paths, notification_count.get()),
+            (vec![Some(vec![PathBuf::from("/projects/source")]); 2], 1)
+        );
     }
 
     #[gpui::test]

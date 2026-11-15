@@ -856,6 +856,39 @@ impl MultiWorkspace {
         self.project_groups = restored;
     }
 
+    pub fn merge_project_group(
+        &mut self,
+        old_key: &ProjectGroupKey,
+        new_key: &ProjectGroupKey,
+        cx: &mut Context<Self>,
+    ) {
+        if old_key == new_key
+            || new_key.path_list().paths().is_empty()
+            || !self
+                .project_groups
+                .iter()
+                .any(|group| group.key == *old_key)
+            || self
+                .held
+                .iter()
+                .any(|held| held.workspace.read(cx).project_group_key(cx) == *old_key)
+        {
+            return;
+        }
+        if self
+            .project_groups
+            .iter()
+            .any(|group| group.key == *new_key)
+        {
+            self.project_groups.retain(|group| group.key != *old_key);
+        } else if let Some(group) = self.group_state_by_key_mut(old_key) {
+            group.key = new_key.clone();
+        }
+        cx.emit(MultiWorkspaceEvent::ProjectGroupsChanged);
+        self.serialize(cx);
+        cx.notify();
+    }
+
     pub fn project_group_keys(&self) -> Vec<ProjectGroupKey> {
         self.project_groups
             .iter()

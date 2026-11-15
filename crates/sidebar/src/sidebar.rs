@@ -657,6 +657,34 @@ fn git_project_group_key(workspace: &Entity<Workspace>, cx: &App) -> ProjectGrou
     )
 }
 
+fn saved_entries_have_loaded(cx: &App) -> bool {
+    ThreadMetadataStore::global(cx).read(cx).has_loaded()
+        && TerminalThreadMetadataStore::global(cx)
+            .read(cx)
+            .has_loaded()
+}
+
+fn project_group_has_saved_entries(key: &ProjectGroupKey, cx: &App) -> bool {
+    let thread_store = ThreadMetadataStore::global(cx).read(cx);
+    let terminal_store = TerminalThreadMetadataStore::global(cx).read(cx);
+    thread_store
+        .entries_for_main_worktree_path(key.path_list(), key.host())
+        .next()
+        .is_some()
+        || thread_store
+            .entries_for_path(key.path_list(), key.host())
+            .next()
+            .is_some()
+        || terminal_store
+            .entries_for_main_worktree_path(key.path_list(), key.host())
+            .next()
+            .is_some()
+        || terminal_store
+            .entries_for_path(key.path_list(), key.host())
+            .next()
+            .is_some()
+}
+
 fn workspace_menu_worktree_labels(
     workspace: &Entity<Workspace>,
     cx: &App,
@@ -1181,6 +1209,44 @@ impl Sidebar {
                 store_cx,
             );
         });
+    }
+
+    fn upgrade_saved_git_identities(
+        &mut self,
+        multi_workspace: &Entity<MultiWorkspace>,
+        cx: &mut Context<Self>,
+    ) {
+        let workspaces = multi_workspace
+            .read(cx)
+            .workspaces()
+            .cloned()
+            .collect::<Vec<_>>();
+        for workspace in workspaces {
+            let project = workspace.read(cx).project().clone();
+            let git_worktree_paths = project.read(cx).git_worktree_paths(cx);
+            if git_worktree_paths == project.read(cx).worktree_paths(cx) {
+                continue;
+            }
+            self.move_entry_paths(&project, &git_worktree_paths, cx);
+
+            let git_key = ProjectGroupKey::from_worktree_paths(
+                &git_worktree_paths,
+                project.read(cx).remote_connection_options(cx).cloned(),
+            );
+            if !saved_entries_have_loaded(cx)
+                || multi_workspace
+                    .read(cx)
+                    .group_state_by_key(&git_key)
+                    .is_none()
+                || project_group_has_saved_entries(&git_key, cx)
+            {
+                continue;
+            }
+            let key = workspace.read(cx).project_group_key(cx);
+            multi_workspace.update(cx, |multi_workspace, cx| {
+                multi_workspace.merge_project_group(&git_key, &key, cx);
+            });
+        }
     }
 
     fn subscribe_to_agent_panel(
@@ -2093,6 +2159,8 @@ impl Sidebar {
         if !multi_workspace.read(cx).multi_workspace_enabled(cx) {
             return;
         }
+
+        self.upgrade_saved_git_identities(&multi_workspace, cx);
 
         let had_notifications = self.has_notifications(cx);
         let previous_shapes: Vec<EntryShape> =

@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{cell::Cell, path::PathBuf, rc::Rc};
 
 use super::*;
 use crate::item::test::TestItem;
@@ -1216,6 +1216,75 @@ async fn test_remove_project_group_opens_unloaded_local_neighbor(cx: &mut TestAp
             "the unloaded local neighboring group should be opened"
         );
     });
+}
+
+#[gpui::test]
+async fn test_merge_project_group(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/project-a", json!({})).await;
+    let project_a = Project::test(fs, ["/project-a".as_ref()], cx).await;
+    let key_a = project_a.read_with(cx, |project, cx| project.project_group_key(cx));
+    let group_key = |path: &str| ProjectGroupKey::new(None, PathList::new(&[PathBuf::from(path)]));
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.restore_project_groups(
+            vec![
+                SerializedProjectGroupState {
+                    key: group_key("/stale-one"),
+                    expanded: true,
+                },
+                SerializedProjectGroupState {
+                    key: group_key("/stale-two"),
+                    expanded: false,
+                },
+                SerializedProjectGroupState {
+                    key: key_a.clone(),
+                    expanded: true,
+                },
+            ],
+            cx,
+        );
+    });
+    let change_count = Rc::new(Cell::new(0));
+    let _subscription = cx.update(|_, cx| {
+        let change_count = change_count.clone();
+        cx.subscribe(
+            &multi_workspace,
+            move |_, event: &MultiWorkspaceEvent, _| {
+                if matches!(event, MultiWorkspaceEvent::ProjectGroupsChanged) {
+                    change_count.set(change_count.get() + 1);
+                }
+            },
+        )
+    });
+
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.merge_project_group(&group_key("/stale-one"), &key_a, cx);
+        multi_workspace.merge_project_group(&group_key("/stale-two"), &group_key("/new"), cx);
+        multi_workspace.merge_project_group(&key_a, &group_key("/other"), cx);
+        multi_workspace.merge_project_group(&group_key("/new"), &group_key("/new"), cx);
+        multi_workspace.merge_project_group(&group_key("/missing"), &key_a, cx);
+        multi_workspace.merge_project_group(
+            &group_key("/new"),
+            &ProjectGroupKey::new(None, PathList::default()),
+            cx,
+        );
+    });
+    cx.run_until_parked();
+
+    let groups = multi_workspace.read_with(cx, |multi_workspace, cx| {
+        multi_workspace
+            .project_groups(cx)
+            .into_iter()
+            .map(|group| (group.key, group.expanded))
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(
+        (groups, change_count.get()),
+        (vec![(group_key("/new"), false), (key_a, true)], 2)
+    );
 }
 
 #[gpui::test]
