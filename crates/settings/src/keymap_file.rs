@@ -1717,12 +1717,18 @@ mod tests {
             super::KeymapFileLoadResult::Success { key_bindings } => key_bindings,
             error => panic!("{error:?}"),
         };
-        cx.bind_keys(load(source, cx));
+        let loaded = load(source, cx);
+        assert!(
+            loaded
+                .iter()
+                .any(|binding| binding.held_modifier().is_some())
+        );
+        cx.bind_keys(loaded);
         assert!(
             cx.key_bindings()
                 .borrow()
                 .bindings()
-                .any(|binding| binding.held_modifier().is_some())
+                .all(|binding| binding.held_modifier().is_none())
         );
         // The same clear/bind path used by handle_keymap_file_changes; only JSON changes.
         cx.clear_key_bindings();
@@ -1756,9 +1762,12 @@ mod tests {
                 .len(),
             1
         );
-        assert!(keymap.bindings().any(
-            |binding| binding.held_modifier().is_some() && binding.keystrokes()[0].key() == "s"
-        ));
+        assert!(
+            load(&source.replace("ctrl-f", "ctrl-s"), cx)
+                .iter()
+                .any(|binding| binding.held_modifier().is_some()
+                    && binding.keystrokes()[0].key() == "s")
+        );
     }
 
     #[gpui::test]

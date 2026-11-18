@@ -333,7 +333,7 @@ pub(crate) fn init_app_menus(platform: &dyn Platform, cx: &App) {
         let cx = cx.to_async();
         move || {
             if let Some(app) = cx.app.upgrade() {
-                app.borrow_mut().update(|cx| cx.clear_pending_keystrokes());
+                app.borrow_mut().update(|cx| cx.cancel_held_modifiers());
             }
         }
     }));

@@ -902,7 +902,7 @@ pub struct App {
     pub(crate) focus_handles: Arc<RwLock<FocusMap>>,
     pub(crate) keymap: Rc<RefCell<Keymap>>,
     // Consumption follows a physical press across windows; active names do not.
-    pub(crate) consumed_held_keys: SmallVec<[String; 2]>,
+    pub(crate) held_modifiers: Rc<RefCell<crate::HeldModifiers>>,
     pub(crate) keyboard_layout: Box<dyn PlatformKeyboardLayout>,
     pub(crate) keyboard_mapper: Rc<dyn PlatformKeyboardMapper>,
     pub(crate) global_action_listeners:
@@ -1049,7 +1049,7 @@ impl App {
                 window_handles: FxHashMap::default(),
                 focus_handles: Arc::new(RwLock::new(FocusMap::default())),
                 keymap: Rc::new(RefCell::new(Keymap::default())),
-                consumed_held_keys: SmallVec::new(),
+                held_modifiers: Rc::default(),
                 keyboard_layout,
                 keyboard_mapper,
                 global_action_listeners: Default::default(),
@@ -2754,14 +2754,13 @@ impl App {
         self.keymap.clone()
     }
 
-    fn cancel_held_modifiers(&mut self) {
-        for window in self.windows() {
-            window
-                .update(self, |_, window, cx| {
-                    window.cancel_held_modifiers(cx);
-                })
-                .ok();
-        }
+    pub(crate) fn cancel_held_modifiers(&mut self) {
+        self.held_modifiers.borrow_mut().cancel();
+        self.clear_pending_keystrokes();
+        // A reload can occur inside a window update. Clear that borrowed window
+        // after it is returned to the app, even if another window sees the new
+        // shared keymap version first.
+        self.defer(|cx| cx.clear_pending_keystrokes());
     }
 
     /// Register a global handler for actions invoked via the keyboard. These handlers are run at

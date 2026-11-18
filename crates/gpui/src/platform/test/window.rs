@@ -19,6 +19,7 @@ use std::{
 };
 
 pub(crate) struct TestWindowState {
+    modifiers: crate::Modifiers,
     pub(crate) bounds: Bounds<Pixels>,
     pub(crate) handle: AnyWindowHandle,
     display: Rc<dyn PlatformDisplay>,
@@ -95,6 +96,7 @@ impl TestWindow {
             None => Arc::new(HeadlessAtlas::default()),
         };
         Self(Rc::new(Mutex::new(TestWindowState {
+            modifiers: crate::Modifiers::default(),
             bounds: params.bounds,
             display,
             platform,
@@ -295,6 +297,9 @@ impl TestWindow {
     }
 
     pub fn simulate_input(&mut self, event: PlatformInput) -> bool {
+        if let PlatformInput::ModifiersChanged(event) = &event {
+            self.0.lock().modifiers = event.modifiers;
+        }
         let mut lock = self.0.lock();
         let Some(mut callback) = lock.input_callback.take() else {
             return false;
@@ -380,7 +385,7 @@ impl PlatformWindow for TestWindow {
     }
 
     fn modifiers(&self) -> crate::Modifiers {
-        crate::Modifiers::default()
+        self.0.lock().modifiers
     }
 
     fn capslock(&self) -> crate::Capslock {

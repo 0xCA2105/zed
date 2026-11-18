@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+feature_tree="$(cargo tree --locked -p gpui_platform -e normal,build,dev,features --features bench-support,runtime_shaders)"
+if [[ "$feature_tree" == *'feature "test-support"'* ]]; then
+    echo "The held input benchmark must not enable test-support." >&2
+    exit 1
+fi
+
+cargo bench --locked -p gpui_platform --bench held_input --profile release-fast \
+    --features bench-support,runtime_shaders --config profile.release-fast.debug=0 -- "$@"

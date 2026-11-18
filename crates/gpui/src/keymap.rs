@@ -21,7 +21,7 @@ pub struct Keymap {
     bindings: Vec<KeyBinding>,
     binding_indices_by_action_id: TypeIdHashMap<SmallVec<[usize; 3]>>,
     disabled_binding_indices: Vec<usize>,
-    held_modifier_indices: Vec<usize>,
+    held_modifiers: Vec<HeldModifier>,
     version: KeymapVersion,
 }
 
@@ -31,9 +31,9 @@ pub struct BindingIndex(usize);
 
 fn disabled_binding_matches_context(disabled_binding: &KeyBinding, binding: &KeyBinding) -> bool {
     if !disabled_binding
-        .when_held
+        .when_held()
         .iter()
-        .all(|name| binding.when_held.contains(name))
+        .all(|name| binding.when_held().contains(name))
     {
         return false;
     }
@@ -72,10 +72,16 @@ impl Keymap {
     /// Add more bindings to the keymap.
     pub fn add_bindings<T: IntoIterator<Item = KeyBinding>>(&mut self, bindings: T) {
         for binding in bindings {
+            if let Some(name) = binding.held_modifier() {
+                self.held_modifiers.push(HeldModifier {
+                    key: binding.keystrokes()[0].clone(),
+                    predicate: binding.context_predicate.clone(),
+                    name: name.clone(),
+                });
+                continue;
+            }
             let action_id = binding.action().as_any().type_id();
-            if binding.held_modifier.is_some() {
-                self.held_modifier_indices.push(self.bindings.len());
-            } else if is_no_action(&*binding.action) || is_unbind(&*binding.action) {
+            if is_no_action(&*binding.action) || is_unbind(&*binding.action) {
                 self.disabled_binding_indices.push(self.bindings.len());
             } else {
                 self.binding_indices_by_action_id
@@ -94,7 +100,7 @@ impl Keymap {
         self.bindings.clear();
         self.binding_indices_by_action_id.clear();
         self.disabled_binding_indices.clear();
-        self.held_modifier_indices.clear();
+        self.held_modifiers.clear();
         self.version.0 += 1;
     }
 
@@ -104,30 +110,28 @@ impl Keymap {
     }
 
     pub(crate) fn has_held_modifiers(&self) -> bool {
-        !self.held_modifier_indices.is_empty()
+        !self.held_modifiers.is_empty()
+    }
+
+    /// Cheap key-only rejection before building a context stack.
+    pub(crate) fn might_activate_held_modifier(&self, input: &Keystroke) -> bool {
+        self.held_modifiers
+            .iter()
+            .any(|declaration| input.should_match(&declaration.key))
     }
 
     pub(crate) fn held_modifier_for_input(
         &self,
         input: &Keystroke,
         contexts: &[KeyContext],
-    ) -> Option<&KeyBinding> {
-        self.held_modifier_indices
-            .iter()
-            .filter_map(|&ix| {
-                let binding = &self.bindings[ix];
-                let depth = self.binding_enabled(binding, contexts)?;
-                // Require the predicate at the focused context, not at an ancestor editor
-                // behind a search field, palette, or embedded input.
-                if depth != contexts.len()
-                    || binding.match_keystrokes(std::slice::from_ref(input)) != Some(false)
-                {
-                    return None;
-                }
-                Some((depth, ix, binding))
-            })
-            .max_by_key(|(depth, ix, _)| (*depth, *ix))
-            .map(|(_, _, binding)| binding)
+    ) -> Option<&HeldModifier> {
+        self.held_modifiers.iter().rev().find(|declaration| {
+            input.should_match(&declaration.key)
+                && declaration
+                    .predicate
+                    .as_ref()
+                    .is_none_or(|predicate| predicate.eval(contexts))
+        })
     }
 
     /// Iterate over all bindings for the given action, in the order they were added. For display,
@@ -173,16 +177,62 @@ impl Keymap {
         })
     }
 
+    /// Native menus cannot express transient held conditions.
+    pub fn bindings_for_native_menu_action<'a>(
+        &'a self,
+        action: &'a dyn Action,
+    ) -> impl 'a + DoubleEndedIterator<Item = &'a KeyBinding> {
+        self.bindings_for_action(action)
+            .filter(|binding| binding.when_held().is_empty())
+    }
+
+    fn binding_uses_held_modifier(&self, binding: &KeyBinding, contexts: &[KeyContext]) -> bool {
+        binding.keystrokes().iter().any(|key| {
+            self.held_modifier_for_input(key.as_keystroke(), contexts)
+                .is_some()
+        })
+    }
+
+    pub(crate) fn bindings_for_action_with_held<'a>(
+        &'a self,
+        action: &'a dyn Action,
+        contexts: &'a [KeyContext],
+        held: &'a [SharedString],
+    ) -> impl 'a + DoubleEndedIterator<Item = &'a KeyBinding> {
+        self.binding_indices_by_action_id
+            .get(&action.type_id())
+            .map_or(&[] as &[_], SmallVec::as_slice)
+            .iter()
+            .filter_map(move |&ix| {
+                let binding = &self.bindings[ix];
+                if !binding.action().partial_eq(action)
+                    || self.binding_uses_held_modifier(binding, contexts)
+                {
+                    return None;
+                }
+                let (matches, _) = self.resolve_bindings_for_input(
+                    binding.keystrokes(),
+                    contexts,
+                    held,
+                    self.bindings().enumerate().rev(),
+                    false,
+                );
+                matches
+                    .first()
+                    .is_some_and(|(first, _)| first.0 == ix)
+                    .then_some(binding)
+            })
+    }
+
     /// Returns all bindings that might match the input without checking context. The bindings
     /// returned in precedence order (reverse of the order they were added to the keymap).
     pub fn all_bindings_for_input(&self, input: &[Keystroke]) -> Vec<KeyBinding> {
         self.bindings()
             .rev()
             .filter(|binding| {
-                binding.held_modifier.is_none()
-                    && binding
-                        .match_keystrokes(input)
-                        .is_some_and(|pending| !pending)
+                binding
+                    .match_keystrokes(input)
+                    .is_some_and(|pending| !pending)
             })
             .cloned()
             .collect()
@@ -225,6 +275,7 @@ impl Keymap {
             context_stack,
             held,
             self.bindings().enumerate().rev(),
+            true,
         );
         (
             bindings
@@ -249,14 +300,13 @@ impl Keymap {
         context_stack: &[KeyContext],
         held: &[SharedString],
         keymap_bindings: impl IntoIterator<Item = (usize, &'a KeyBinding)>,
+        include_pending: bool,
     ) -> (SmallVec<[(BindingIndex, &'a KeyBinding); 1]>, bool) {
         let mut matched_bindings = SmallVec::<[(usize, BindingIndex, &KeyBinding); 1]>::new();
         let mut pending_bindings = SmallVec::<[(usize, BindingIndex, &KeyBinding); 1]>::new();
 
         for (ix, binding) in keymap_bindings {
-            if binding.held_modifier.is_some()
-                || !binding.when_held.iter().all(|name| held.contains(name))
-            {
+            if !binding.when_held().iter().all(|name| held.contains(name)) {
                 continue;
             }
             let Some(depth) = self.binding_enabled(binding, context_stack) else {
@@ -268,7 +318,7 @@ impl Keymap {
 
             if !pending {
                 matched_bindings.push((depth, BindingIndex(ix), binding));
-            } else {
+            } else if include_pending {
                 pending_bindings.push((depth, BindingIndex(ix), binding));
             }
         }
@@ -276,14 +326,14 @@ impl Keymap {
         matched_bindings.sort_by(|(depth_a, ix_a, a), (depth_b, ix_b, b)| {
             depth_b
                 .cmp(depth_a)
-                .then(b.when_held.len().cmp(&a.when_held.len()))
+                .then(b.when_held().len().cmp(&a.when_held().len()))
                 .then(ix_b.cmp(ix_a))
         });
 
-        let first_priority = matched_bindings
-            .first()
-            .map(|(depth, ix, binding)| (*depth, binding.when_held.len(), *ix));
-
+        let has_held_candidates = matched_bindings
+            .iter()
+            .chain(pending_bindings.iter())
+            .any(|(_, _, binding)| !binding.when_held().is_empty());
         let mut bindings: SmallVec<[_; 1]> = SmallVec::new();
         let mut first_binding_index = None;
         let mut unbound_bindings: Vec<&KeyBinding> = Vec::new();
@@ -320,22 +370,65 @@ impl Keymap {
             first_binding_index.get_or_insert(ix);
         }
 
+        if !include_pending {
+            return (bindings, false);
+        }
+        if has_held_candidates {
+            // Resolve a candidate's completion using the same null/unbind/source and
+            // specificity rules as dispatch. File order alone is insufficient here.
+            let first_priority = bindings.first().map(|(ix, binding)| {
+                (
+                    self.binding_enabled(binding, context_stack).unwrap(),
+                    binding.when_held().len(),
+                    *ix,
+                )
+            });
+            let mut full_input = SmallVec::<[&Keystroke; 4]>::new();
+            for (_, _, candidate) in pending_bindings {
+                if is_no_action(candidate.action()) || is_unbind(candidate.action()) {
+                    continue;
+                }
+                full_input.clear();
+                full_input.extend(input.iter().map(AsKeystroke::as_keystroke));
+                full_input.extend(
+                    candidate.keystrokes[input.len()..]
+                        .iter()
+                        .map(AsKeystroke::as_keystroke),
+                );
+                let (complete, _) = self.resolve_bindings_for_input(
+                    &full_input,
+                    context_stack,
+                    held,
+                    self.bindings().enumerate().rev(),
+                    false,
+                );
+                if complete.iter().any(|(ix, binding)| {
+                    let priority = (
+                        self.binding_enabled(binding, context_stack).unwrap(),
+                        binding.when_held().len(),
+                        *ix,
+                    );
+                    first_priority.is_none_or(|first| {
+                        if first.1 == 0 && priority.1 == 0 {
+                            priority.2 >= first.2
+                        } else {
+                            priority >= first
+                        }
+                    })
+                }) {
+                    return (bindings, true);
+                }
+            }
+            return (bindings, false);
+        }
+
+        // Preserve upstream prefix behavior when no held conditions are active.
         let mut pending = HashSet::default();
-        for (depth, ix, binding) in pending_bindings.into_iter().rev() {
-            if let Some(priority) = first_priority
-                && (priority.1 > 0 || !binding.when_held.is_empty())
-                && priority > (depth, binding.when_held.len(), ix)
-            {
+        for (_, ix, binding) in pending_bindings.into_iter().rev() {
+            if first_binding_index.is_some_and(|binding_ix| binding_ix > ix) {
                 continue;
             }
-            if let Some(binding_ix) = first_binding_index
-                && binding.when_held.is_empty()
-                && first_priority.is_none_or(|p| p.1 == 0)
-                && binding_ix > ix
-            {
-                continue;
-            }
-            if is_no_action(&*binding.action) || is_unbind(&*binding.action) {
+            if is_no_action(binding.action()) || is_unbind(binding.action()) {
                 pending.remove(&&binding.keystrokes);
                 continue;
             }
@@ -362,6 +455,16 @@ impl Keymap {
         input: &[Keystroke],
         context_stack: &[KeyContext],
     ) -> Vec<KeyBinding> {
+        self.possible_next_bindings_for_input_with_held(input, context_stack, &[])
+    }
+
+    /// Find eligible completions using the same held conditions as dispatch.
+    pub fn possible_next_bindings_for_input_with_held(
+        &self,
+        input: &[Keystroke],
+        context_stack: &[KeyContext],
+        held: &[SharedString],
+    ) -> Vec<KeyBinding> {
         // Keeps `null` and `Unbind` bindings, which can disable candidates.
         let bindings_extending_input = self
             .bindings()
@@ -379,6 +482,9 @@ impl Keymap {
             .iter()
             .filter(|(_, binding)| !is_no_action(&*binding.action) && !is_unbind(&*binding.action))
             .filter_map(|&(ix, binding)| {
+                if self.binding_uses_held_modifier(binding, context_stack) {
+                    return None;
+                }
                 let depth = self.binding_enabled(binding, context_stack)?;
                 // Use the typed input rather than the binding's own keystrokes. A typed keystroke
                 // can match through its physical key, like `alt-s`, or the character it produced,
@@ -393,8 +499,9 @@ impl Keymap {
                 let (dispatched, _) = self.resolve_bindings_for_input(
                     &full_input,
                     context_stack,
-                    &[],
+                    held,
                     bindings_extending_input.iter().copied(),
+                    false,
                 );
                 dispatched
                     .iter()
@@ -402,8 +509,11 @@ impl Keymap {
                     .then_some((depth, ix, binding))
             })
             .collect::<Vec<_>>();
-        candidates.sort_unstable_by(|(depth_a, ix_a, _), (depth_b, ix_b, _)| {
-            depth_b.cmp(depth_a).then(ix_b.cmp(ix_a))
+        candidates.sort_unstable_by(|(depth_a, ix_a, a), (depth_b, ix_b, b)| {
+            depth_b
+                .cmp(depth_a)
+                .then(b.when_held().len().cmp(&a.when_held().len()))
+                .then(ix_b.cmp(ix_a))
         });
 
         candidates
@@ -423,6 +533,179 @@ mod tests {
         test_only,
         [ActionAlpha, ActionBeta, ActionGamma, ActionDelta,]
     );
+
+    #[test]
+    fn held_modifier_only_keys_are_not_advertised_as_actions() {
+        let map = Keymap::new(vec![
+            KeyBinding::new("ctrl-f", ActionAlpha, None),
+            KeyBinding::new("ctrl-f x", ActionBeta, None),
+            KeyBinding::new("ctrl-f", NoAction, Some("Editor"))
+                .with_held_modifier("word".into())
+                .unwrap(),
+        ]);
+        let editor = [KeyContext::parse("Editor").unwrap()];
+        let terminal = [KeyContext::parse("Terminal").unwrap()];
+        assert_eq!(
+            map.bindings_for_action_with_held(&ActionAlpha, &editor, &[])
+                .count(),
+            0
+        );
+        assert_eq!(
+            map.bindings_for_action_with_held(&ActionAlpha, &terminal, &[])
+                .count(),
+            1
+        );
+        assert_eq!(
+            map.bindings_for_action_with_held(&ActionBeta, &editor, &[])
+                .count(),
+            0
+        );
+        assert!(
+            map.possible_next_bindings_for_input(&[Keystroke::parse("ctrl-f").unwrap()], &editor)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn held_unrelated_names_preserve_ordinary_prefix_precedence() {
+        let map = Keymap::new(vec![
+            KeyBinding::new("ctrl-x y", ActionAlpha, Some("Editor")),
+            KeyBinding::new("ctrl-x", ActionBeta, Some("Workspace")),
+        ]);
+        let contexts = [
+            KeyContext::parse("Workspace").unwrap(),
+            KeyContext::parse("Editor").unwrap(),
+        ];
+        let input = [Keystroke::parse("ctrl-x").unwrap()];
+        assert!(!map.bindings_for_input(&input, &contexts).1);
+        assert!(
+            !map.bindings_for_input_with_held(&input, &contexts, &["unrelated".into()])
+                .1
+        );
+    }
+
+    #[test]
+    fn held_native_menu_shortcuts_are_always_unconditional() {
+        let mut map = Keymap::new(vec![
+            KeyBinding::new("ctrl-alt-9", ActionAlpha, None).with_when_held(["word".into()]),
+        ]);
+        assert_eq!(map.bindings_for_native_menu_action(&ActionAlpha).count(), 0);
+        map.add_bindings([KeyBinding::new("cmd-s", ActionAlpha, None)]);
+        let native = map
+            .bindings_for_native_menu_action(&ActionAlpha)
+            .collect::<Vec<_>>();
+        assert_eq!(native.len(), 1);
+        assert_eq!(native[0].keystrokes()[0].key(), "s");
+        map.add_bindings([KeyBinding::new(
+            "cmd-s",
+            Unbind("test_only::ActionAlpha".into()),
+            None,
+        )]);
+        assert_eq!(map.bindings_for_native_menu_action(&ActionAlpha).count(), 0);
+    }
+
+    #[test]
+    fn held_action_discovery_obeys_conditions_and_specificity() {
+        let map = Keymap::new(vec![
+            KeyBinding::new("ctrl-l", ActionAlpha, Some("Editor"))
+                .with_when_held(["word".into(), "select".into()]),
+            KeyBinding::new("ctrl-l", NoAction, Some("Editor")),
+            KeyBinding::new("ctrl-j", ActionAlpha, Some("Editor")),
+            KeyBinding::new("ctrl-k", ActionAlpha, Some("Editor")).with_when_held(["word".into()]),
+            KeyBinding::new("ctrl-f", NoAction, Some("Editor"))
+                .with_held_modifier("word".into())
+                .unwrap(),
+        ]);
+        assert_eq!(
+            map.bindings().len(),
+            4,
+            "declarations are not action bindings"
+        );
+        let context = [KeyContext::parse("Editor").unwrap()];
+        let ordinary = map
+            .bindings_for_action_with_held(&ActionAlpha, &context, &[])
+            .collect::<Vec<_>>();
+        assert_eq!(ordinary.len(), 1);
+        assert_eq!(ordinary[0].keystrokes()[0].key(), "j");
+        let held = ["word".into(), "select".into()];
+        let active = map
+            .bindings_for_action_with_held(&ActionAlpha, &context, &held)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            active.len(),
+            3,
+            "a later ordinary null does not hide the more specific action"
+        );
+    }
+
+    #[test]
+    fn held_pending_resolution_preserves_typed_alias_and_source_precedence() {
+        let map = Keymap::new(vec![
+            KeyBinding::new("alt-s x", ActionAlpha, Some("Editor"))
+                .with_when_held(["word".into()])
+                .with_meta(crate::KeyBindingMetaIndex(0)),
+            KeyBinding::new("ß x", NoAction, Some("Editor"))
+                .with_when_held(["word".into()])
+                .with_meta(crate::KeyBindingMetaIndex(1)),
+        ]);
+        let context = [KeyContext::parse("Editor").unwrap()];
+        let input = [Keystroke::parse("alt-s->ß").unwrap()];
+        let held = ["word".into()];
+        assert!(map.bindings_for_input_with_held(&input, &context, &held).1);
+        let next = map.possible_next_bindings_for_input_with_held(&input, &context, &held);
+        assert_eq!(next.len(), 1);
+        assert!(next[0].action().partial_eq(&ActionAlpha));
+    }
+
+    #[test]
+    fn held_regression_irrelevant_short_unbind_does_not_block_chord() {
+        let map = Keymap::new(vec![
+            KeyBinding::new("ctrl-x ctrl-y", ActionBeta, Some("Editor"))
+                .with_when_held(["word".into()]),
+            KeyBinding::new(
+                "ctrl-x",
+                Unbind("test_only::ActionAlpha".into()),
+                Some("Editor"),
+            )
+            .with_when_held(["word".into(), "select".into()]),
+        ]);
+        let contexts = [KeyContext::parse("Editor").unwrap()];
+        let held = ["word".into(), "select".into()];
+        let input = [
+            Keystroke::parse("ctrl-x").unwrap(),
+            Keystroke::parse("ctrl-y").unwrap(),
+        ];
+        let (full, _) = map.bindings_for_input_with_held(&input, &contexts, &held);
+        assert!(full[0].action().partial_eq(&ActionBeta));
+        assert!(
+            map.bindings_for_input_with_held(&input[..1], &contexts, &held)
+                .1,
+            "unbinding an absent short action must not prevent an unrelated chord"
+        );
+    }
+
+    #[test]
+    fn held_regression_held_sequence_specificity() {
+        let map = Keymap::new(vec![
+            KeyBinding::new("ctrl-x ctrl-y", ActionAlpha, Some("Editor"))
+                .with_when_held(["word".into(), "select".into()]),
+            KeyBinding::new("ctrl-x ctrl-y", NoAction, Some("Editor"))
+                .with_when_held(["word".into()]),
+        ]);
+        let contexts = [KeyContext::parse("Editor").unwrap()];
+        let held = ["word".into(), "select".into()];
+        let input = [
+            Keystroke::parse("ctrl-x").unwrap(),
+            Keystroke::parse("ctrl-y").unwrap(),
+        ];
+        let (full, _) = map.bindings_for_input_with_held(&input, &contexts, &held);
+        assert!(full[0].action().partial_eq(&ActionAlpha));
+        assert!(
+            map.bindings_for_input_with_held(&input[..1], &contexts, &held)
+                .1,
+            "the winning held sequence must be allowed to start"
+        );
+    }
 
     #[test]
     fn held_bindings_specificity_fallback_context_and_sequences() {

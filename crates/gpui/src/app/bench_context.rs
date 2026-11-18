@@ -1208,6 +1208,25 @@ impl<'a, 'measurement> BenchWindowContext<'a, 'measurement> {
             .expect("benchmark window was unexpectedly closed")
     }
 
+    /// Deliver a platform input event through the normal window callback. This is
+    /// the external input boundary for production-path benchmarks, not a synthetic
+    /// shortcut; modifier changes update the benchmark platform's physical state.
+    /// Must be called outside `update` to avoid re-entering an app borrow.
+    pub fn dispatch_input(&mut self, input: crate::PlatformInput) -> bool {
+        let mut platform_window = {
+            let mut app = self.cx.app.borrow_mut();
+            app.windows
+                .get_mut(self.window.window_id())
+                .and_then(|window| window.as_deref_mut())
+                .expect("benchmark window was unexpectedly closed")
+                .platform_window
+                .as_test()
+                .expect("benchmark platform window")
+                .clone()
+        };
+        platform_window.simulate_input(input)
+    }
+
     /// Resizes the window's content area as the platform does when the user drags its
     /// edge, through the window's resize callback. The next frame redraws at the new size.
     ///

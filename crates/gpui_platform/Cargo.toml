@@ -32,6 +32,12 @@ harness = false
 required-features = ["bench-support"]
 
 [[bench]]
+name = "held_input"
+path = "../gpui/benches/held_input.rs"
+harness = false
+required-features = ["bench-support"]
+
+[[bench]]
 name = "focus_cleanup"
 path = "../gpui/benches/focus_cleanup.rs"
 harness = false

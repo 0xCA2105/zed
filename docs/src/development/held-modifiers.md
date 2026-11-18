@@ -100,7 +100,11 @@ Held activation and deactivation cancel pending multi-stroke input without repla
 A lower-priority ordinary sequence cannot delay a more specific held binding.
 Sequences explicitly configured inside a held section still use Zed's normal
 sequence rules, including its existing timeout where applicable. Holding a
-modifier itself never starts a sequence or timer.
+modifier itself never starts a sequence or timer. An unrelated held name does not
+change ordinary sequence precedence. Shortcut hints and which-key use the active
+held names and omit shortcuts whose keys are reserved as modifiers. Native macOS
+menu equivalents only use unconditional bindings; conditional actions remain
+available through GPUI dispatch.
 
 ## Complete navigation layout {#example}
 
@@ -126,10 +130,17 @@ names. Reloading bindings also cancels them, including keyboard-layout changes t
 Press the modifier again to activate it in the new context. Returning focus or
 pressing Control again does not revive an old press.
 
+`workspace::SendKeystrokes` treats a declared modifier key as a consumed tap:
+it runs no ordinary shortcut and does not activate or release a physical held
+press. Synthetic actions still use the current physical held names, after checking
+the current context and native modifier state. Opening a native application menu
+cancels active names because menu tracking can absorb key-up events.
+
 Cancelled presses remain consumed until release. Their repeats cannot insert text
 even if Control was released first. A fresh non-repeat key-down clears any stale
-record, so a missed key-up does not suppress future typing. Native modifier state
-on subsequent events also cancels stale combinations. No local event system can
+record, so a missed key-up does not suppress future typing. Physical native modifier state
+on subsequent events also cancels stale combinations. Shortcut normalization,
+such as folding Shift+1 into `!`, does not count as a physical Shift release. No local event system can
 infer an unreported physical release in the absence of any further events; focus,
 native-modifier, reload, and fresh-press events provide reconciliation points.
 
@@ -195,15 +206,57 @@ For a manual smoke test, use a file containing `one two three` and verify:
 - Editing F to S in the keymap while keys are pressed, then testing without restart.
 - A non-QWERTY layout, dead keys, and an IME, including repeats after Control release.
 
+## Input-routing benchmark {#benchmark}
+
+The benchmark runs key-down/key-up pairs through the normal GPUI platform callback,
+focused contexts and action dispatch. It covers an unconfigured editor, two and
+eight inactive declarations, an unrelated terminal context, and an active layer.
+It excludes editor text storage, native IME processing and editor rendering costs;
+it measures input routing, not end-to-end typing latency.
+
+```sh
+BENCH_MEASUREMENT=foreground-allocations script/bench-held-input
+```
+
+The script checks that the benchmark dependency graph contains no `test-support`
+features. Fixtures warm input and focus setup before measuring, and assert event
+consumption and action counts. Use the same fixture, compiler and build profile
+when comparing revisions. Agent-run builds and measurements are bounded to five
+minutes per invocation.
+
+The following comparison uses the reviewed commit `e00a1ad` and these fixes,
+with identical benchmark fixtures and physical-input boundaries. Both use Rust
+1.98.1, `release-fast` with debug information disabled, and the same Apple Silicon
+Mac. Each measured run uses 10 samples, 300 ms warmup and one second of measurement.
+Runs are sequential; wall-time ranges below are the two observed run medians,
+including Criterion calibration. Counts are allocations per key-down/key-up pair.
+
+| Case                                | Allocations before → after | Wall time before → after (µs) |
+| ----------------------------------- | -------------------------- | ----------------------------- |
+| Unconfigured editor                 | 24 → 24                    | 3.47–3.50 → 3.40–3.47         |
+| Two inactive declarations, editor   | 32 → 24                    | 3.93–3.95 → 3.44–3.48         |
+| Two inactive declarations, terminal | 32 → 24                    | 3.51–3.57 → 3.09–3.11         |
+| Eight inactive declarations, editor | 32 → 24                    | 4.09–4.13 → 3.55–3.57         |
+| Active layer and action dispatch    | 30 → 26                    | 4.15–4.17 → 3.87–3.98         |
+
+The inactive layer adds no allocations in this workload. Active context
+reconciliation still has a cost. On this target, the inline `KeyBinding` layout is
+184 bytes, compared with 256 before these fixes and 176 in the stable source:
+held metadata adds one eight-byte pointer to ordinary bindings. Conditional
+metadata is allocated when the keymap loads and shared when bindings are cloned.
+Conditional multi-stroke prefixes check possible completions through the shared
+resolver. Large groups of conditional sequences on the same prefix can cost more;
+that workload is outside this typing benchmark.
+
 ## Validation on November 18, 2026 {#validation}
 
 Validated on macOS 26.7.3 (Apple Silicon), using Rust 1.98.1 and runtime shaders:
 
 | Check                                                         | Result                               |
 | ------------------------------------------------------------- | ------------------------------------ |
-| Full GPUI library suite                                       | 423 passed; 2 existing tests ignored |
+| Full GPUI library suite                                       | 439 passed; 2 existing tests ignored |
 | Full settings library suite                                   | 52 passed                            |
-| macOS physical-key identity test                              | 1 passed                             |
+| Full macOS library suite                                      | 12 passed                            |
 | Complete example with real editor actions and reload          | 1 passed                             |
 | Native Zed build                                              | Passed                               |
 | Rust formatting; changed documentation and example formatting | Passed                               |
@@ -219,12 +272,21 @@ the corresponding event-state transitions, but do not replace physical-key tests
 
 - `settings::KeymapFile` loads declarations and requirements, generates their JSON
   schema, and reports errors through the existing partial-load error UI.
-- `gpui::KeyBinding` carries names and requirements. `Keymap` indexes declarations
-  separately and adds requirement count to matching precedence.
-- `gpui::HeldModifiers` keeps window-local active and cancelled state. An app-local consumed-key list
-  suppresses repeats even when a press moves to another window. `Window`
-  consumes presses before prefix matching and action dispatch; `App` cancels state
-  when bindings change. `DispatchTree` forwards active names to the matcher.
+- `gpui::KeyBinding` carries optional shared held metadata. The settings loader
+  keeps its existing transport API; `Keymap` extracts declarations into a separate
+  collection before indexing action bindings. Ordinary bindings carry one optional
+  pointer instead of inline held-name storage.
+- One application-owned `gpui::HeldModifiers` registry owns press lifetime. Windows
+  share it and use active names only for the owning window. A release or fresh
+  key-down retires the record regardless of which window receives it. Focus changes
+  cancel activation without releasing consumption.
+- `Window` checks declaration keys before building contexts, queries physical
+  modifier state through the existing platform API, and evaluates input preference
+  once. `App` clears pending sequences on reload, including windows borrowed during
+  the reload. The native bridge only preserves physical identity and IME suppression.
+- Dispatch, conditional prefix matching and shortcut discovery share the complete
+  binding resolver. Ordinary fallback prefix rules stay upstream-compatible. Native
+  menus use a separate unconditional-only view of action bindings.
 - `gpui_macos::window` remembers physical keys consumed as modifiers so an IME
   cannot turn their later repeats into text. This only affects consumed presses.
 - Tests exercise state transitions, precedence, dispatch conflicts, parser errors,

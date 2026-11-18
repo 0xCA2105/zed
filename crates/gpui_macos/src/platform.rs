@@ -344,7 +344,7 @@ impl MacPlatform {
                     // later ones take display precedence. See the discussion on
                     // https://github.com/zed-industries/zed/issues/23621
                     let keystrokes = keymap
-                        .bindings_for_action(action.as_ref())
+                        .bindings_for_native_menu_action(action.as_ref())
                         .find_or_first(|binding| {
                             binding.predicate().is_none_or(|predicate| {
                                 predicate.eval(DEFAULT_CONTEXT.get_or_init(|| {

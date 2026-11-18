@@ -1941,6 +1941,10 @@ mod tests {
         cx.update(|cx| load(example, cx));
         let mut cx = EditorTestContext::new(cx).await;
         let down = |cx: &mut EditorTestContext, source, is_held| {
+            cx.simulate_event(gpui::ModifiersChangedEvent {
+                modifiers: Keystroke::parse(source).unwrap().modifiers,
+                capslock: Default::default(),
+            });
             cx.simulate_event(KeyDownEvent {
                 keystroke: Keystroke::parse(source).unwrap(),
                 is_held,

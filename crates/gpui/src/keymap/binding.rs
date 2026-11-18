@@ -14,8 +14,22 @@ pub struct KeyBinding {
     pub(crate) meta: Option<KeyBindingMetaIndex>,
     /// The json input string used when building the keybinding, if any
     pub(crate) action_input: Option<SharedString>,
-    pub(crate) held_modifier: Option<SharedString>,
-    pub(crate) when_held: SmallVec<[SharedString; 2]>,
+    // Optional, shared metadata keeps ordinary bindings compact. Declarations are
+    // accepted by the existing loader, then extracted into Keymap's own collection.
+    held: Option<Rc<HeldBinding>>,
+}
+
+enum HeldBinding {
+    Declaration(SharedString),
+    Requirements(SmallVec<[SharedString; 2]>),
+}
+
+/// A declaration is not an action binding. Only Keymap's activation lookup uses it.
+#[derive(Clone)]
+pub(crate) struct HeldModifier {
+    pub key: KeybindingKeystroke,
+    pub predicate: Option<Rc<KeyBindingContextPredicate>>,
+    pub name: SharedString,
 }
 
 impl Clone for KeyBinding {
@@ -26,8 +40,7 @@ impl Clone for KeyBinding {
             context_predicate: self.context_predicate.clone(),
             meta: self.meta,
             action_input: self.action_input.clone(),
-            held_modifier: self.held_modifier.clone(),
-            when_held: self.when_held.clone(),
+            held: self.held.clone(),
         }
     }
 }
@@ -98,8 +111,7 @@ impl KeyBinding {
             context_predicate,
             meta: None,
             action_input,
-            held_modifier: None,
-            when_held: SmallVec::new(),
+            held: None,
         })
     }
 
@@ -110,27 +122,42 @@ impl KeyBinding {
             "held_modifiers requires one ordinary key, optionally with native modifiers; sequences and standalone native modifiers are not supported"
         );
         anyhow::ensure!(
-            self.when_held.is_empty(),
+            self.when_held().is_empty(),
             "held modifiers cannot depend on when_held"
         );
-        self.held_modifier = Some(name);
+        self.held = Some(Rc::new(HeldBinding::Declaration(name)));
         Ok(self)
     }
 
     /// Require all of these named held modifiers for this binding.
     pub fn with_when_held(mut self, names: impl IntoIterator<Item = SharedString>) -> Self {
-        self.when_held = names.into_iter().collect();
+        let names: SmallVec<[SharedString; 2]> = names.into_iter().collect();
+        if !names.is_empty() {
+            assert!(
+                self.held_modifier().is_none(),
+                "held declarations cannot have conditions"
+            );
+            self.held = Some(Rc::new(HeldBinding::Requirements(names)));
+        } else if self.held_modifier().is_none() {
+            self.held = None;
+        }
         self
     }
 
     /// Name declared by this binding, if it is a held modifier declaration.
     pub fn held_modifier(&self) -> Option<&SharedString> {
-        self.held_modifier.as_ref()
+        match self.held.as_deref() {
+            Some(HeldBinding::Declaration(name)) => Some(name),
+            _ => None,
+        }
     }
 
     /// Names required by this binding.
     pub fn when_held(&self) -> &[SharedString] {
-        &self.when_held
+        match self.held.as_deref() {
+            Some(HeldBinding::Requirements(names)) => names,
+            _ => &[],
+        }
     }
 
     /// Set the metadata for this binding.

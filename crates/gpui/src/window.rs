@@ -1297,7 +1297,8 @@ pub struct Window {
     pub(crate) focus_generation: u64,
     pending_input: Option<PendingInput>,
     pending_modifier: ModifierState,
-    held_modifiers: HeldModifiers,
+    held_modifiers: Rc<RefCell<HeldModifiers>>,
+    dispatching_synthetic_key: bool,
     pub(crate) pending_input_observers: SingleSubscriberSet<AnyObserver>,
     prompt: Option<RenderablePromptHandle>,
     pub(crate) client_inset: Option<Pixels>,
@@ -2421,7 +2422,8 @@ impl Window {
             focus_generation: 0,
             pending_input: None,
             pending_modifier: ModifierState::default(),
-            held_modifiers: HeldModifiers::default(),
+            held_modifiers: cx.held_modifiers.clone(),
+            dispatching_synthetic_key: false,
             pending_input_observers: SingleSubscriberSet::new(),
             prompt: None,
             client_inset: None,
@@ -2632,7 +2634,9 @@ impl Window {
 
         self.focus = Some(handle.id);
         self.focus_generation = self.focus_generation.wrapping_add(1);
-        self.held_modifiers.cancel();
+        self.held_modifiers
+            .borrow_mut()
+            .cancel_window(self.handle.window_id());
         self.clear_pending_keystrokes(cx);
 
         self.refresh();
@@ -2640,7 +2644,9 @@ impl Window {
 
     /// Remove focus from all elements within this context's window.
     pub fn blur(&mut self, cx: &mut App) {
-        self.held_modifiers.cancel();
+        self.held_modifiers
+            .borrow_mut()
+            .cancel_window(self.handle.window_id());
         self.clear_pending_keystrokes(cx);
 
         if !self.focus_enabled {
@@ -5831,6 +5837,7 @@ impl Window {
     /// You can create a keystroke with Keystroke::parse("").
     pub fn dispatch_keystroke(&mut self, keystroke: Keystroke, cx: &mut App) -> bool {
         let keystroke = keystroke.with_simulated_ime();
+        let was_synthetic = std::mem::replace(&mut self.dispatching_synthetic_key, true);
         let result = self.dispatch_event(
             PlatformInput::KeyDown(KeyDownEvent {
                 keystroke: keystroke.clone(),
@@ -5839,6 +5846,7 @@ impl Window {
             }),
             cx,
         );
+        self.dispatching_synthetic_key = was_synthetic;
         if !result.propagate {
             return true;
         }
@@ -6044,7 +6052,9 @@ impl Window {
             default_prevented: self.default_prevented,
             held_modifier_key: match &event {
                 PlatformInput::KeyDown(event)
-                    if !event.is_held && self.held_modifiers.consumes_key(&event.keystroke) =>
+                    if !self.dispatching_synthetic_key
+                        && !event.is_held
+                        && self.held_modifiers.borrow().consumes_key(&event.keystroke) =>
                 {
                     Some(event.keystroke.key.clone())
                 }
@@ -6306,74 +6316,117 @@ impl Window {
     }
 
     pub(crate) fn cancel_held_modifiers(&mut self, cx: &mut App) {
-        if !self.held_modifiers.is_empty() {
-            self.held_modifiers.cancel();
+        let changed = self
+            .held_modifiers
+            .borrow_mut()
+            .cancel_window(self.handle.window_id());
+        if changed {
             self.clear_pending_keystrokes(cx);
         }
     }
 
-    /// Consume modifier presses before shortcut prefixes or raw key listeners see them.
-    /// Key-up only changes state; it never goes through action dispatch or text replay.
-    fn dispatch_held_modifier_event(&mut self, event: &dyn Any, cx: &mut App) -> bool {
-        if !cx.keymap.borrow().has_held_modifiers()
-            && self.held_modifiers.is_empty()
-            && cx.consumed_held_keys.is_empty()
-        {
+    /// Application-wide consumption precedes raw listeners and multi-stroke dispatch.
+    /// Only possible declaration keys or active layers need a context snapshot.
+    fn dispatch_held_modifier_event(
+        &mut self,
+        event: &dyn Any,
+        input_preference: InputPreference,
+        cx: &mut App,
+    ) -> bool {
+        if !cx.keymap.borrow().has_held_modifiers() && self.held_modifiers.borrow().is_empty() {
             return false;
         }
-        if self.held_modifiers.sync_keymap(&cx.keymap.borrow()) {
+        let changed = self
+            .held_modifiers
+            .borrow_mut()
+            .sync_keymap(&cx.keymap.borrow());
+        if changed {
             self.clear_pending_keystrokes(cx);
+        }
+
+        if self.held_modifiers.borrow().has_active() {
+            let modifiers = event
+                .downcast_ref::<ModifiersChangedEvent>()
+                .map_or_else(|| self.platform_window.modifiers(), |event| event.modifiers);
+            let changed = self
+                .held_modifiers
+                .borrow_mut()
+                .reconcile_modifiers(modifiers);
+            if changed {
+                self.clear_pending_keystrokes(cx);
+            }
+        }
+        if !self.dispatching_synthetic_key {
+            if let Some(up) = event.downcast_ref::<KeyUpEvent>() {
+                let consumed = self.held_modifiers.borrow_mut().key_up(&up.keystroke);
+                if consumed {
+                    self.clear_pending_keystrokes(cx);
+                }
+                return consumed;
+            }
+        }
+        let Some(down) = event.downcast_ref::<KeyDownEvent>() else {
+            return false;
+        };
+        if !self.dispatching_synthetic_key {
+            if down.is_held {
+                if self.held_modifiers.borrow().consumes_key(&down.keystroke) {
+                    return true;
+                }
+            } else {
+                let retired = self.held_modifiers.borrow_mut().key_up(&down.keystroke);
+                if retired {
+                    self.clear_pending_keystrokes(cx);
+                }
+            }
+        }
+        let candidate = !down.is_held
+            && input_preference == InputPreference::KeyBindings
+            && cx
+                .keymap
+                .borrow()
+                .might_activate_held_modifier(&down.keystroke);
+        let active = !self
+            .held_modifiers
+            .borrow()
+            .names_for_window(self.handle.window_id())
+            .is_empty();
+        if !candidate && !active {
+            return false;
         }
         let contexts = self.context_stack();
-        let modifiers = if let Some(event) = event.downcast_ref::<KeyDownEvent>() {
-            event.keystroke.modifiers
-        } else if let Some(event) = event.downcast_ref::<KeyUpEvent>() {
-            event.keystroke.modifiers
-        } else if let Some(event) = event.downcast_ref::<ModifiersChangedEvent>() {
-            event.modifiers
-        } else {
-            return false;
-        };
-        if self.held_modifiers.reconcile(modifiers, &contexts) {
-            self.clear_pending_keystrokes(cx);
+        if active {
+            let changed = self
+                .held_modifiers
+                .borrow_mut()
+                .reconcile_contexts(&contexts);
+            if changed {
+                self.clear_pending_keystrokes(cx);
+            }
         }
-        let consumed = if let Some(key_down) = event.downcast_ref::<KeyDownEvent>() {
-            if key_down.is_held && cx.consumed_held_keys.contains(&key_down.keystroke.key) {
-                return true;
+        if candidate {
+            let consumed = if let Some(declaration) = cx
+                .keymap
+                .borrow()
+                .held_modifier_for_input(&down.keystroke, &contexts)
+            {
+                if !self.dispatching_synthetic_key {
+                    self.held_modifiers.borrow_mut().activate(
+                        &down.keystroke,
+                        declaration,
+                        self.handle.window_id(),
+                    );
+                }
+                true
+            } else {
+                false
+            };
+            if consumed {
+                self.clear_pending_keystrokes(cx);
             }
-            if !key_down.is_held {
-                cx.consumed_held_keys
-                    .retain(|key| key != &key_down.keystroke.key);
-            }
-            let allow_activation = self.input_preference(event, cx) == InputPreference::KeyBindings;
-            let consumed = self.held_modifiers.key_down(
-                &key_down.keystroke,
-                key_down.is_held,
-                &cx.keymap.borrow(),
-                &contexts,
-                allow_activation,
-            );
-            if consumed && !key_down.is_held {
-                cx.consumed_held_keys.push(key_down.keystroke.key.clone());
-            }
-            consumed
-        } else if let Some(key_up) = event.downcast_ref::<KeyUpEvent>() {
-            let consumed = cx.consumed_held_keys.contains(&key_up.keystroke.key);
-            cx.consumed_held_keys
-                .retain(|key| key != &key_up.keystroke.key);
-            self.held_modifiers.key_up(&key_up.keystroke) || consumed
-        } else {
-            false
-        };
-        if consumed
-            && !event
-                .downcast_ref::<KeyDownEvent>()
-                .is_some_and(|event| event.is_held)
-        {
-            // Cancel pending multi-stroke input, without replaying it under a new layer.
-            self.clear_pending_keystrokes(cx);
+            return consumed;
         }
-        consumed
+        false
     }
 
     fn dispatch_key_event(&mut self, event: &dyn Any, cx: &mut App) {
@@ -6381,7 +6434,8 @@ impl Window {
             self.draw(cx).clear(cx);
         }
 
-        if self.dispatch_held_modifier_event(event, cx) {
+        let input_preference = self.input_preference(event, cx);
+        if self.dispatch_held_modifier_event(event, input_preference, cx) {
             self.pending_modifier.saw_other_input = true;
             cx.propagate_event = false;
             return;
@@ -6447,8 +6501,6 @@ impl Window {
             return;
         };
 
-        let input_preference = self.input_preference(event, cx);
-
         cx.propagate_event = true;
         self.dispatch_keystroke_interceptors(
             &keystroke,
@@ -6477,7 +6529,9 @@ impl Window {
             currently_pending.keystrokes,
             keystroke.clone(),
             &dispatch_path,
-            self.held_modifiers.names(),
+            self.held_modifiers
+                .borrow()
+                .names_for_window(self.handle.window_id()),
         );
 
         if !match_result.to_replay.is_empty() {
@@ -6569,8 +6623,12 @@ impl Window {
         let task = self.spawn(cx, async move |cx| {
             cx.background_executor.timer(remaining).await;
             cx.update(move |window, cx| {
-                if (cx.keymap.borrow().has_held_modifiers() || !window.held_modifiers.is_empty())
-                    && window.held_modifiers.sync_keymap(&cx.keymap.borrow())
+                if (cx.keymap.borrow().has_held_modifiers()
+                    || !window.held_modifiers.borrow().is_empty())
+                    && window
+                        .held_modifiers
+                        .borrow_mut()
+                        .sync_keymap(&cx.keymap.borrow())
                 {
                     window.clear_pending_keystrokes(cx);
                     return;
@@ -6589,7 +6647,10 @@ impl Window {
                 let to_replay = window.rendered_frame.dispatch_tree.flush_dispatch(
                     currently_pending.keystrokes,
                     &dispatch_path,
-                    window.held_modifiers.names(),
+                    window
+                        .held_modifiers
+                        .borrow()
+                        .names_for_window(window.handle.window_id()),
                 );
 
                 window.pending_input_changed(cx);
@@ -7149,7 +7210,13 @@ impl Window {
     pub fn bindings_for_action(&self, action: &dyn Action) -> Vec<KeyBinding> {
         self.rendered_frame
             .dispatch_tree
-            .bindings_for_action(action, &self.rendered_frame.dispatch_tree.context_stack)
+            .bindings_for_action_with_held(
+                action,
+                &self.rendered_frame.dispatch_tree.context_stack,
+                self.held_modifiers
+                    .borrow()
+                    .names_for_window(self.handle.window_id()),
+            )
     }
 
     /// Returns the highest precedence key binding that invokes an action on the currently focused
@@ -7157,9 +7224,12 @@ impl Window {
     pub fn highest_precedence_binding_for_action(&self, action: &dyn Action) -> Option<KeyBinding> {
         self.rendered_frame
             .dispatch_tree
-            .highest_precedence_binding_for_action(
+            .highest_precedence_binding_for_action_with_held(
                 action,
                 &self.rendered_frame.dispatch_tree.context_stack,
+                self.held_modifiers
+                    .borrow()
+                    .names_for_window(self.handle.window_id()),
             )
     }
 
@@ -7170,7 +7240,13 @@ impl Window {
         context: KeyContext,
     ) -> Vec<KeyBinding> {
         let dispatch_tree = &self.rendered_frame.dispatch_tree;
-        dispatch_tree.bindings_for_action(action, &[context])
+        dispatch_tree.bindings_for_action_with_held(
+            action,
+            &[context],
+            self.held_modifiers
+                .borrow()
+                .names_for_window(self.handle.window_id()),
+        )
     }
 
     /// Returns the highest precedence key binding for an action in a context. This is more
@@ -7181,7 +7257,13 @@ impl Window {
         context: KeyContext,
     ) -> Option<KeyBinding> {
         let dispatch_tree = &self.rendered_frame.dispatch_tree;
-        dispatch_tree.highest_precedence_binding_for_action(action, &[context])
+        dispatch_tree.highest_precedence_binding_for_action_with_held(
+            action,
+            &[context],
+            self.held_modifiers
+                .borrow()
+                .names_for_window(self.handle.window_id()),
+        )
     }
 
     /// Returns any bindings that would invoke an action on the given focus handle if it were
@@ -7196,7 +7278,16 @@ impl Window {
         let Some(context_stack) = self.context_stack_for_focus_handle(focus_handle) else {
             return vec![];
         };
-        dispatch_tree.bindings_for_action(action, &context_stack)
+        let held = self.held_modifiers.borrow();
+        dispatch_tree.bindings_for_action_with_held(
+            action,
+            &context_stack,
+            if self.focus == Some(focus_handle.id) {
+                held.names_for_window(self.handle.window_id())
+            } else {
+                &[]
+            },
+        )
     }
 
     /// Returns the highest precedence key binding that would invoke an action on the given focus
@@ -7209,14 +7300,29 @@ impl Window {
     ) -> Option<KeyBinding> {
         let dispatch_tree = &self.rendered_frame.dispatch_tree;
         let context_stack = self.context_stack_for_focus_handle(focus_handle)?;
-        dispatch_tree.highest_precedence_binding_for_action(action, &context_stack)
+        let held = self.held_modifiers.borrow();
+        dispatch_tree.highest_precedence_binding_for_action_with_held(
+            action,
+            &context_stack,
+            if self.focus == Some(focus_handle.id) {
+                held.names_for_window(self.handle.window_id())
+            } else {
+                &[]
+            },
+        )
     }
 
     /// Find the bindings that can follow the current input sequence for the current context stack.
     pub fn possible_bindings_for_input(&self, input: &[Keystroke]) -> Vec<KeyBinding> {
         self.rendered_frame
             .dispatch_tree
-            .possible_next_bindings_for_input(input, &self.context_stack())
+            .possible_next_bindings_for_input(
+                input,
+                &self.context_stack(),
+                self.held_modifiers
+                    .borrow()
+                    .names_for_window(self.handle.window_id()),
+            )
     }
 
     fn context_stack_for_focus_handle(
