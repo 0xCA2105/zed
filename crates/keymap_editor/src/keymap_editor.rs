@@ -844,7 +844,12 @@ impl KeymapEditor {
     ) {
         let key_bindings_ptr = cx.key_bindings();
         let lock = key_bindings_ptr.borrow();
-        let key_bindings = lock.bindings().collect::<Vec<_>>();
+        // The graphical editor has no held-condition controls. Keep these in JSON
+        // rather than editing them as unconditional shortcuts and losing their scope.
+        let key_bindings = lock
+            .bindings()
+            .filter(|binding| binding.held_modifier().is_none() && binding.when_held().is_empty())
+            .collect::<Vec<_>>();
         let mut unmapped_action_names = HashSet::from_iter(cx.all_action_names().iter().copied());
         let action_documentation = cx.action_documentation();
         let mut generator = KeymapFile::action_schema_generator();

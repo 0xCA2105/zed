@@ -74,6 +74,16 @@ pub struct KeymapSection {
     /// on macOS. See the documentation for more details.
     #[serde(default)]
     use_key_equivalents: bool,
+    /// Exclusive held-key modifiers. Each key is one keystroke, and each value has a `name`.
+    /// The key is consumed immediately in this context; it has no tap or release action.
+    #[serde(default)]
+    #[schemars(with = "Option<IndexMap<String, HeldModifierConfig>>")]
+    held_modifiers: Option<IndexMap<String, Value>>,
+    /// Apply these bindings only while all named modifiers are held. Extra held names are allowed.
+    /// At equal context depth, more required names take precedence, then later bindings win.
+    #[serde(default)]
+    #[schemars(with = "Option<Vec<String>>")]
+    when_held: Option<Value>,
     /// This keymap section's unbindings, as a JSON object mapping keystrokes to actions. These are
     /// parsed before `bindings`, so bindings later in the same section can still take precedence.
     #[serde(default)]
@@ -95,6 +105,20 @@ pub struct KeymapSection {
     // Unfortunately the implementations of the `Spanned` types for preserving this information are
     // highly inconvenient (`serde_spanned`) and in some cases don't work at all here
     // (`json_spanned_>value`). Serde should really have builtin support for this.
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct HeldModifierConfig {
+    /// A case-sensitive name starting with an ASCII letter, followed by letters, digits, `_` or `-`.
+    name: String,
+}
+
+fn valid_held_modifier_name(name: &str) -> bool {
+    name.starts_with(|c: char| c.is_ascii_alphabetic())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 impl KeymapSection {
@@ -274,6 +298,8 @@ impl KeymapFile {
         for KeymapSection {
             context,
             use_key_equivalents,
+            held_modifiers,
+            when_held,
             unbind,
             bindings,
             unrecognized_fields,
@@ -298,6 +324,65 @@ impl KeymapFile {
 
             let mut section_errors = String::new();
 
+            let held_names: Vec<String> = match when_held
+                .as_ref()
+                .map(|value| serde_json::from_value::<Vec<String>>(value.clone()))
+                .transpose()
+            {
+                Ok(names) => names.unwrap_or_default(),
+                Err(error) => {
+                    errors.push((
+                        context.clone(),
+                        format!(" Invalid when_held: expected an array of names: {error}"),
+                    ));
+                    continue;
+                }
+            };
+            if held_names.iter().enumerate().any(|(ix, name)| {
+                !valid_held_modifier_name(name) || held_names[..ix].contains(name)
+            }) {
+                errors.push((context.clone(), " Invalid when_held: names must be unique and start with an ASCII letter, followed by letters, digits, `_` or `-`.".into()));
+                continue;
+            }
+            if let Some(declarations) = held_modifiers {
+                if !held_names.is_empty() {
+                    errors.push((
+                        context.clone(),
+                        " held_modifiers cannot be declared in a when_held section.".into(),
+                    ));
+                    continue;
+                }
+                for (keystroke, value) in declarations {
+                    let result = (|| -> anyhow::Result<KeyBinding> {
+                        let config: HeldModifierConfig = serde_json::from_value(value.clone())?;
+                        anyhow::ensure!(
+                            valid_held_modifier_name(&config.name),
+                            "invalid name: use an ASCII letter followed by letters, digits, `_` or `-`"
+                        );
+                        KeyBinding::load(
+                            keystroke,
+                            Box::new(NoAction),
+                            context_predicate.clone(),
+                            *use_key_equivalents,
+                            None,
+                            cx,
+                        )?
+                        .with_held_modifier(config.name.into())
+                    })();
+                    match result {
+                        Ok(binding) => key_bindings.push(binding),
+                        Err(error) => {
+                            let _ = write!(
+                                section_errors,
+                                "\n\n- In held_modifiers {}: {}",
+                                MarkdownInlineCode(keystroke),
+                                MarkdownEscaped(&error.to_string())
+                            );
+                        }
+                    }
+                }
+            }
+
             if !unrecognized_fields.is_empty() {
                 write!(
                     section_errors,
@@ -318,7 +403,9 @@ impl KeymapFile {
                     );
                     match result {
                         Ok(key_binding) => {
-                            key_bindings.push(key_binding);
+                            key_bindings.push(key_binding.with_when_held(
+                                held_names.iter().cloned().map(SharedString::from),
+                            ));
                         }
                         Err(err) => {
                             let mut lines = err.lines();
@@ -350,7 +437,9 @@ impl KeymapFile {
                     );
                     match result {
                         Ok(key_binding) => {
-                            key_bindings.push(key_binding);
+                            key_bindings.push(key_binding.with_when_held(
+                                held_names.iter().cloned().map(SharedString::from),
+                            ));
                         }
                         Err(err) => {
                             let mut lines = err.lines();
@@ -375,6 +464,20 @@ impl KeymapFile {
                 errors.push((context.clone(), section_errors))
             }
         }
+
+        // Resolve names after every section has loaded, allowing forward references.
+        let declared: collections::HashSet<SharedString> = key_bindings
+            .iter()
+            .filter_map(|binding| binding.held_modifier().cloned())
+            .collect();
+        key_bindings.retain(|binding| {
+            if let Some(name) = binding.when_held().iter().find(|name| !declared.contains(*name)) {
+                errors.push((binding.predicate().map(|p| p.to_string()).unwrap_or_default(), format!(" Unknown held modifier {} in when_held; declare it in held_modifiers in this file.", MarkdownInlineCode(name))));
+                false
+            } else {
+                true
+            }
+        });
 
         if errors.is_empty() {
             KeymapFileLoadResult::Success { key_bindings }
@@ -1140,6 +1243,13 @@ impl KeymapFile {
             let target_context_parsed =
                 KeyBindingContextPredicate::parse(target.context.unwrap_or("")).ok();
             for (index, section) in keymap.sections().enumerate() {
+                if section
+                    .when_held
+                    .as_ref()
+                    .is_some_and(|held| held.as_array().is_none_or(|names| !names.is_empty()))
+                {
+                    continue;
+                }
                 let section_context_parsed =
                     KeyBindingContextPredicate::parse(&section.context).ok();
                 if section_context_parsed != target_context_parsed {
@@ -1288,7 +1398,8 @@ impl KeymapFile {
                 let section = &keymap.0[self.index];
                 let binding_count = section.bindings.as_ref().map_or(0, IndexMap::len);
                 let unbind_count = section.unbind.as_ref().map_or(0, IndexMap::len);
-                binding_count + unbind_count == 1
+                let held_count = section.held_modifiers.as_ref().map_or(0, IndexMap::len);
+                binding_count + unbind_count + held_count == 1
             }
         }
     }
@@ -1596,6 +1707,114 @@ mod tests {
 
     gpui::actions!(test_keymap_file, [StringAction, InputAction]);
 
+    #[gpui::test]
+    fn held_modifiers_load_forward_references_and_reload(cx: &mut App) {
+        let source = r#"[
+            {"context":"Editor", "when_held":["word"], "bindings":{"ctrl-l":"test_keymap_file::StringAction"}},
+            {"context":"Editor", "held_modifiers":{"ctrl-f":{"name":"word"}}}
+        ]"#;
+        let load = |source: &str, cx: &App| match KeymapFile::load(source, cx) {
+            super::KeymapFileLoadResult::Success { key_bindings } => key_bindings,
+            error => panic!("{error:?}"),
+        };
+        cx.bind_keys(load(source, cx));
+        assert!(
+            cx.key_bindings()
+                .borrow()
+                .bindings()
+                .any(|binding| binding.held_modifier().is_some())
+        );
+        // The same clear/bind path used by handle_keymap_file_changes; only JSON changes.
+        cx.clear_key_bindings();
+        cx.bind_keys(load(
+            &source
+                .replace("ctrl-f", "ctrl-s")
+                .replace("ctrl-l", "ctrl-j"),
+            cx,
+        ));
+        let keymap = cx.key_bindings();
+        let keymap = keymap.borrow();
+        let contexts = [gpui::KeyContext::parse("Editor").unwrap()];
+        assert!(
+            keymap
+                .bindings_for_input_with_held(
+                    &[Keystroke::parse("ctrl-l").unwrap()],
+                    &contexts,
+                    &["word".into()]
+                )
+                .0
+                .is_empty()
+        );
+        assert_eq!(
+            keymap
+                .bindings_for_input_with_held(
+                    &[Keystroke::parse("ctrl-j").unwrap()],
+                    &contexts,
+                    &["word".into()]
+                )
+                .0
+                .len(),
+            1
+        );
+        assert!(keymap.bindings().any(
+            |binding| binding.held_modifier().is_some() && binding.keystrokes()[0].key() == "s"
+        ));
+    }
+
+    #[gpui::test]
+    fn held_modifiers_invalid_definitions_report_errors_without_enabling_bindings(cx: &mut App) {
+        for (source, expected) in [
+            (
+                r#"[{"held_modifiers":{"ctrl-f x":{"name":"word"}}}]"#,
+                "one ordinary key",
+            ),
+            (
+                r#"[{"held_modifiers":{"ctrl":{"name":"word"}}}]"#,
+                "one ordinary key",
+            ),
+            (
+                r#"[{"held_modifiers":{"ctrl-f":{"name":""}}}]"#,
+                "invalid name",
+            ),
+            (
+                r#"[{"held_modifiers":{"ctrl-f":{"name":"word","tap":"anything"}}}]"#,
+                "unknown field",
+            ),
+            (
+                r#"[{"when_held":["missing"],"bindings":{"ctrl-l":"test_keymap_file::StringAction"}}]"#,
+                "Unknown held modifier",
+            ),
+            (
+                r#"[{"when_held":"word","bindings":{"ctrl-l":"test_keymap_file::StringAction"}}]"#,
+                "expected an array",
+            ),
+            (
+                r#"[{"when_held":["word","word"],"bindings":{"ctrl-l":"test_keymap_file::StringAction"}}]"#,
+                "must be unique",
+            ),
+            (
+                r#"[{"when_held":["word"],"held_modifiers":{"ctrl-d":{"name":"select"}}}]"#,
+                "cannot be declared",
+            ),
+        ] {
+            match KeymapFile::load(source, cx) {
+                super::KeymapFileLoadResult::SomeFailedToLoad {
+                    key_bindings,
+                    error_message,
+                } => {
+                    assert!(key_bindings.is_empty(), "{source}");
+                    assert!(
+                        error_message.to_string().contains(expected),
+                        "{error_message}"
+                    );
+                }
+                result => {
+                    panic!("expected useful configuration error for {source}, got {result:?}")
+                }
+            }
+        }
+    }
+
     #[test]
     fn can_deserialize_keymap_with_trailing_comma() {
         let json = indoc::indoc! {"[
@@ -1837,6 +2056,39 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn held_modifiers_survive_graphical_edits_to_ordinary_bindings() {
+        let source = r#"[
+            {"context":"Editor","when_held":["word"],"bindings":{"ctrl-l":"test_keymap_file::StringAction"}},
+            {"context":"Editor","held_modifiers":{"ctrl-f":{"name":"word"}},"bindings":{"ctrl-l":"test_keymap_file::StringAction"}}
+        ]"#;
+        let result = KeymapFile::update_keybinding(
+            KeybindUpdateOperation::Remove {
+                target: KeybindUpdateTarget {
+                    context: Some("Editor"),
+                    keystrokes: &parse_keystrokes("ctrl-l"),
+                    action_name: "test_keymap_file::StringAction",
+                    action_arguments: None,
+                },
+                target_keybind_source: KeybindSource::User,
+            },
+            source.into(),
+            4,
+            &DummyKeyboardMapper,
+            &HashMap::default(),
+            gpui::OperatingSystem::Mac,
+        )
+        .unwrap();
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed[0]["when_held"], serde_json::json!(["word"]));
+        assert_eq!(
+            parsed[0]["bindings"]["ctrl-l"],
+            "test_keymap_file::StringAction"
+        );
+        assert_eq!(parsed[1]["held_modifiers"]["ctrl-f"]["name"], "word");
+        assert!(parsed[1]["bindings"].as_object().unwrap().is_empty());
     }
 
     #[test]

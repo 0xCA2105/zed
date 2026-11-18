@@ -901,6 +901,8 @@ pub struct App {
     pub(crate) window_handles: FxHashMap<WindowId, AnyWindowHandle>,
     pub(crate) focus_handles: Arc<RwLock<FocusMap>>,
     pub(crate) keymap: Rc<RefCell<Keymap>>,
+    // Consumption follows a physical press across windows; active names do not.
+    pub(crate) consumed_held_keys: SmallVec<[String; 2]>,
     pub(crate) keyboard_layout: Box<dyn PlatformKeyboardLayout>,
     pub(crate) keyboard_mapper: Rc<dyn PlatformKeyboardMapper>,
     pub(crate) global_action_listeners:
@@ -1047,6 +1049,7 @@ impl App {
                 window_handles: FxHashMap::default(),
                 focus_handles: Arc::new(RwLock::new(FocusMap::default())),
                 keymap: Rc::new(RefCell::new(Keymap::default())),
+                consumed_held_keys: SmallVec::new(),
                 keyboard_layout,
                 keyboard_mapper,
                 global_action_listeners: Default::default(),
@@ -2731,11 +2734,17 @@ impl App {
     /// Register key bindings.
     pub fn bind_keys(&mut self, bindings: impl IntoIterator<Item = KeyBinding>) {
         self.keymap.borrow_mut().add_bindings(bindings);
+        if self.keymap.borrow().has_held_modifiers() {
+            self.cancel_held_modifiers();
+        }
         self.pending_effects.push_back(Effect::RefreshWindows);
     }
 
     /// Clear all key bindings in the app.
     pub fn clear_key_bindings(&mut self) {
+        if self.keymap.borrow().has_held_modifiers() {
+            self.cancel_held_modifiers();
+        }
         self.keymap.borrow_mut().clear();
         self.pending_effects.push_back(Effect::RefreshWindows);
     }
@@ -2743,6 +2752,16 @@ impl App {
     /// Get all key bindings in the app.
     pub fn key_bindings(&self) -> Rc<RefCell<Keymap>> {
         self.keymap.clone()
+    }
+
+    fn cancel_held_modifiers(&mut self) {
+        for window in self.windows() {
+            window
+                .update(self, |_, window, cx| {
+                    window.cancel_held_modifiers(cx);
+                })
+                .ok();
+        }
     }
 
     /// Register a global handler for actions invoked via the keyboard. These handlers are run at

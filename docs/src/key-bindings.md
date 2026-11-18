@@ -39,6 +39,10 @@ Anything that you end up doing on the keymap editor also gets reflected on the `
 
 ## User Keymaps
 
+This fork also supports [held-key modifiers](./development/held-modifiers.md).
+Use `held_modifiers` to declare modifier-only keys and `when_held` to make ordinary
+bindings conditional on them. Both fields use the existing keymap live reload.
+
 The keymap file is stored in the following locations for each platform:
 
 - macOS/Linux: `~/.config/zed/keymap.json`

@@ -12,19 +12,20 @@ use crate::{
     Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
     EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
-    Hsla, InputHandler, InputPreference, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent,
-    Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent,
-    MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels,
-    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
-    PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
-    RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
-    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
-    StrikethroughStyle, Style, SubpixelSprite, Subscription, SystemWindowTab,
-    SystemWindowTabController, TabStopMap, Task, TextInputConfiguration, TextInputStateChange,
-    TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState, TransformationMatrix,
-    Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
-    WindowControls, WindowDecorations, WindowInsets, WindowOptions, WindowParams, WindowTextSystem,
-    WindowVisibility, point, prelude::*, px, rems, size, transparent_black,
+    HeldModifiers, Hsla, InputHandler, InputPreference, IsZero, KeyBinding, KeyContext,
+    KeyDownEvent, KeyEvent, KeyUpEvent, Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex,
+    Modifiers, ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent,
+    MouseUpEvent, Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
+    PlatformInputHandler, PlatformWindow, Point, PolychromeSprite, Priority, PromptButton,
+    PromptLevel, Quad, Render, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams,
+    Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y,
+    ScaledPixels, Scene, Shadow, SharedString, Size, StrikethroughStyle, Style, SubpixelSprite,
+    Subscription, SystemWindowTab, SystemWindowTabController, TabStopMap, Task,
+    TextInputConfiguration, TextInputStateChange, TextRenderingMode, TextStyle,
+    TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle,
+    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
+    WindowInsets, WindowOptions, WindowParams, WindowTextSystem, WindowVisibility, point,
+    prelude::*, px, rems, size, transparent_black,
 };
 
 use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
@@ -1296,6 +1297,7 @@ pub struct Window {
     pub(crate) focus_generation: u64,
     pending_input: Option<PendingInput>,
     pending_modifier: ModifierState,
+    held_modifiers: HeldModifiers,
     pub(crate) pending_input_observers: SingleSubscriberSet<AnyObserver>,
     prompt: Option<RenderablePromptHandle>,
     pub(crate) client_inset: Option<Pixels>,
@@ -2184,6 +2186,7 @@ impl Window {
                 handle
                     .update(&mut cx, |_, window, cx| {
                         window.active.set(active);
+                        window.cancel_held_modifiers(cx);
                         window.modifiers = window.platform_window.modifiers();
                         window.capslock = window.platform_window.capslock();
                         window
@@ -2418,6 +2421,7 @@ impl Window {
             focus_generation: 0,
             pending_input: None,
             pending_modifier: ModifierState::default(),
+            held_modifiers: HeldModifiers::default(),
             pending_input_observers: SingleSubscriberSet::new(),
             prompt: None,
             client_inset: None,
@@ -2448,6 +2452,9 @@ impl Window {
 pub struct DispatchEventResult {
     pub propagate: bool,
     pub default_prevented: bool,
+    /// A modifier-only key-down was consumed. Platforms that send repeats to an
+    /// IME before GPUI must keep consuming that physical press until key-up.
+    pub held_modifier_key: Option<String>,
 }
 
 /// Indicates which region of the window is visible. Content falling outside of this mask will not be
@@ -2625,6 +2632,7 @@ impl Window {
 
         self.focus = Some(handle.id);
         self.focus_generation = self.focus_generation.wrapping_add(1);
+        self.held_modifiers.cancel();
         self.clear_pending_keystrokes(cx);
 
         self.refresh();
@@ -2632,6 +2640,7 @@ impl Window {
 
     /// Remove focus from all elements within this context's window.
     pub fn blur(&mut self, cx: &mut App) {
+        self.held_modifiers.cancel();
         self.clear_pending_keystrokes(cx);
 
         if !self.focus_enabled {
@@ -6033,6 +6042,14 @@ impl Window {
         DispatchEventResult {
             propagate: cx.propagate_event,
             default_prevented: self.default_prevented,
+            held_modifier_key: match &event {
+                PlatformInput::KeyDown(event)
+                    if !event.is_held && self.held_modifiers.consumes_key(&event.keystroke) =>
+                {
+                    Some(event.keystroke.key.clone())
+                }
+                _ => None,
+            },
         }
     }
 
@@ -6288,9 +6305,86 @@ impl Window {
         }
     }
 
+    pub(crate) fn cancel_held_modifiers(&mut self, cx: &mut App) {
+        if !self.held_modifiers.is_empty() {
+            self.held_modifiers.cancel();
+            self.clear_pending_keystrokes(cx);
+        }
+    }
+
+    /// Consume modifier presses before shortcut prefixes or raw key listeners see them.
+    /// Key-up only changes state; it never goes through action dispatch or text replay.
+    fn dispatch_held_modifier_event(&mut self, event: &dyn Any, cx: &mut App) -> bool {
+        if !cx.keymap.borrow().has_held_modifiers()
+            && self.held_modifiers.is_empty()
+            && cx.consumed_held_keys.is_empty()
+        {
+            return false;
+        }
+        if self.held_modifiers.sync_keymap(&cx.keymap.borrow()) {
+            self.clear_pending_keystrokes(cx);
+        }
+        let contexts = self.context_stack();
+        let modifiers = if let Some(event) = event.downcast_ref::<KeyDownEvent>() {
+            event.keystroke.modifiers
+        } else if let Some(event) = event.downcast_ref::<KeyUpEvent>() {
+            event.keystroke.modifiers
+        } else if let Some(event) = event.downcast_ref::<ModifiersChangedEvent>() {
+            event.modifiers
+        } else {
+            return false;
+        };
+        if self.held_modifiers.reconcile(modifiers, &contexts) {
+            self.clear_pending_keystrokes(cx);
+        }
+        let consumed = if let Some(key_down) = event.downcast_ref::<KeyDownEvent>() {
+            if key_down.is_held && cx.consumed_held_keys.contains(&key_down.keystroke.key) {
+                return true;
+            }
+            if !key_down.is_held {
+                cx.consumed_held_keys
+                    .retain(|key| key != &key_down.keystroke.key);
+            }
+            let allow_activation = self.input_preference(event, cx) == InputPreference::KeyBindings;
+            let consumed = self.held_modifiers.key_down(
+                &key_down.keystroke,
+                key_down.is_held,
+                &cx.keymap.borrow(),
+                &contexts,
+                allow_activation,
+            );
+            if consumed && !key_down.is_held {
+                cx.consumed_held_keys.push(key_down.keystroke.key.clone());
+            }
+            consumed
+        } else if let Some(key_up) = event.downcast_ref::<KeyUpEvent>() {
+            let consumed = cx.consumed_held_keys.contains(&key_up.keystroke.key);
+            cx.consumed_held_keys
+                .retain(|key| key != &key_up.keystroke.key);
+            self.held_modifiers.key_up(&key_up.keystroke) || consumed
+        } else {
+            false
+        };
+        if consumed
+            && !event
+                .downcast_ref::<KeyDownEvent>()
+                .is_some_and(|event| event.is_held)
+        {
+            // Cancel pending multi-stroke input, without replaying it under a new layer.
+            self.clear_pending_keystrokes(cx);
+        }
+        consumed
+    }
+
     fn dispatch_key_event(&mut self, event: &dyn Any, cx: &mut App) {
         if self.invalidator.is_dirty() {
             self.draw(cx).clear(cx);
+        }
+
+        if self.dispatch_held_modifier_event(event, cx) {
+            self.pending_modifier.saw_other_input = true;
+            cx.propagate_event = false;
+            return;
         }
 
         let node_id = self.focus_node_id_in_rendered_frame(self.focus);
@@ -6379,10 +6473,11 @@ impl Window {
             currently_pending = PendingInput::default();
         }
 
-        let match_result = self.rendered_frame.dispatch_tree.dispatch_key(
+        let match_result = self.rendered_frame.dispatch_tree.dispatch_key_with_held(
             currently_pending.keystrokes,
             keystroke.clone(),
             &dispatch_path,
+            self.held_modifiers.names(),
         );
 
         if !match_result.to_replay.is_empty() {
@@ -6474,6 +6569,12 @@ impl Window {
         let task = self.spawn(cx, async move |cx| {
             cx.background_executor.timer(remaining).await;
             cx.update(move |window, cx| {
+                if (cx.keymap.borrow().has_held_modifiers() || !window.held_modifiers.is_empty())
+                    && window.held_modifiers.sync_keymap(&cx.keymap.borrow())
+                {
+                    window.clear_pending_keystrokes(cx);
+                    return;
+                }
                 let Some(currently_pending) = window
                     .pending_input
                     .take()
@@ -6485,10 +6586,11 @@ impl Window {
                 let node_id = window.focus_node_id_in_rendered_frame(window.focus);
                 let dispatch_path = window.rendered_frame.dispatch_tree.dispatch_path(node_id);
 
-                let to_replay = window
-                    .rendered_frame
-                    .dispatch_tree
-                    .flush_dispatch(currently_pending.keystrokes, &dispatch_path);
+                let to_replay = window.rendered_frame.dispatch_tree.flush_dispatch(
+                    currently_pending.keystrokes,
+                    &dispatch_path,
+                    window.held_modifiers.names(),
+                );
 
                 window.pending_input_changed(cx);
                 window.replay_pending_input(to_replay, cx)

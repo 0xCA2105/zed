@@ -58,7 +58,7 @@ use parking_lot::Mutex;
 use raw_window_handle as rwh;
 use smallvec::SmallVec;
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     ffi::{CStr, CString, c_void},
     mem,
     ops::Range,
@@ -681,8 +681,8 @@ struct MacWindowState {
     pre_fullscreen_traffic_light_frames: Option<TrafficLightFrames>,
     transparent_titlebar: bool,
     previous_modifiers_changed_event: Option<PlatformInput>,
-    keystroke_for_do_command: Option<Keystroke>,
-    do_command_handled: Option<bool>,
+    keystroke_for_do_command: Option<(Keystroke, bool)>,
+    do_command_handled: Option<gpui::DispatchEventResult>,
     external_files_dragged: bool,
     // Whether the next left-mouse click is also the focusing click.
     first_mouse: bool,
@@ -2696,6 +2696,41 @@ unsafe fn is_ime_input_source_active() -> bool {
     }
 }
 
+// AppKit keyboard events run on the main thread. Consumption follows the
+// physical press across this process's windows, including the IME-first path.
+thread_local! {
+    static HELD_MODIFIER_KEYS: RefCell<ConsumedHeldKeys> = RefCell::default();
+}
+
+#[derive(Default)]
+struct ConsumedHeldKeys(SmallVec<[(u16, String); 2]>);
+
+impl ConsumedHeldKeys {
+    fn record(&mut self, code: u16, key: String) {
+        if !self.0.iter().any(|(existing, _)| *existing == code) {
+            self.0.push((code, key));
+        }
+    }
+
+    fn key_down(&mut self, code: u16, event: &mut KeyDownEvent) -> bool {
+        if !event.is_held {
+            self.release(code);
+            return false;
+        }
+        if let Some((_, key)) = self.0.iter().find(|(existing, _)| *existing == code) {
+            event.keystroke.key.clone_from(key);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn release(&mut self, code: u16) -> Option<String> {
+        let ix = self.0.iter().position(|(existing, _)| *existing == code)?;
+        Some(self.0.remove(ix).1)
+    }
+}
+
 extern "C" fn handle_key_event(
     this: &AnyObject,
     native_event: *mut AnyObject,
@@ -2711,10 +2746,16 @@ extern "C" fn handle_key_event(
         return Bool::NO;
     };
 
+    let key_code: u16 = unsafe { msg_send![native_event, keyCode] };
+
     let run_callback = |event: PlatformInput| -> Bool {
         let mut callback = window_state.as_ref().lock().event_callback.take();
         let handled: Bool = if let Some(callback) = callback.as_mut() {
-            (!callback(event).propagate).to_objc()
+            let result = callback(event);
+            if let Some(key) = result.held_modifier_key {
+                HELD_MODIFIER_KEYS.with_borrow_mut(|keys| keys.record(key_code, key));
+            }
+            (!result.propagate).to_objc()
         } else {
             Bool::NO
         };
@@ -2723,7 +2764,7 @@ extern "C" fn handle_key_event(
     };
 
     match event {
-        PlatformInput::KeyDown(key_down_event) => {
+        PlatformInput::KeyDown(mut key_down_event) => {
             // For certain keystrokes, macOS will first dispatch a "key equivalent" event.
             // If that event isn't handled, it will then dispatch a "key down" event. GPUI
             // makes no distinction between these two types of events, so we need to ignore
@@ -2734,7 +2775,17 @@ extern "C" fn handle_key_event(
                 return Bool::NO;
             }
 
+            let consumed_repeat = HELD_MODIFIER_KEYS
+                .with_borrow_mut(|keys| keys.key_down(key_code, &mut key_down_event));
             drop(lock);
+
+            if consumed_repeat {
+                // The IME normally gets printable repeats first. A consumed held
+                // modifier must never become text when Control is released first,
+                // including after focus loss, a layout change, or a keymap reload.
+                run_callback(PlatformInput::KeyDown(key_down_event));
+                return Bool::YES;
+            }
 
             let is_composing =
                 with_input_handler(this, |input_handler| input_handler.marked_text_range())
@@ -2780,7 +2831,8 @@ extern "C" fn handle_key_event(
             {
                 {
                     let mut lock = window_state.as_ref().lock();
-                    lock.keystroke_for_do_command = Some(key_down_event.keystroke.clone());
+                    lock.keystroke_for_do_command =
+                        Some((key_down_event.keystroke.clone(), key_down_event.is_held));
                     lock.do_command_handled.take();
                     drop(lock);
                 }
@@ -2794,8 +2846,12 @@ extern "C" fn handle_key_event(
                     }
                 };
                 window_state.as_ref().lock().keystroke_for_do_command.take();
-                if let Some(handled) = window_state.as_ref().lock().do_command_handled.take() {
-                    return handled.to_objc();
+                let result = window_state.as_ref().lock().do_command_handled.take();
+                if let Some(result) = result {
+                    if let Some(key) = result.held_modifier_key {
+                        HELD_MODIFIER_KEYS.with_borrow_mut(|keys| keys.record(key_code, key));
+                    }
+                    return (!result.propagate).to_objc();
                 } else if handled == Bool::YES {
                     return Bool::YES;
                 }
@@ -2840,9 +2896,14 @@ extern "C" fn handle_key_event(
             }
         }
 
-        PlatformInput::KeyUp(_) => {
+        PlatformInput::KeyUp(mut key_up_event) => {
+            HELD_MODIFIER_KEYS.with_borrow_mut(|keys| {
+                if let Some(key) = keys.release(key_code) {
+                    key_up_event.keystroke.key = key;
+                }
+            });
             drop(lock);
-            run_callback(event)
+            run_callback(PlatformInput::KeyUp(key_up_event))
         }
 
         _ => Bool::NO,
@@ -3619,13 +3680,13 @@ extern "C" fn do_command_by_selector(this: &AnyObject, _: Sel, _: Sel) {
     let mut event_callback = lock.event_callback.take();
     drop(lock);
 
-    if let Some((keystroke, callback)) = keystroke.zip(event_callback.as_mut()) {
+    if let Some(((keystroke, is_held), callback)) = keystroke.zip(event_callback.as_mut()) {
         let handled = (callback)(PlatformInput::KeyDown(KeyDownEvent {
             keystroke,
-            is_held: false,
+            is_held,
             prefer_character_input: false,
         }));
-        state.as_ref().lock().do_command_handled = Some(!handled.propagate);
+        state.as_ref().lock().do_command_handled = Some(handled);
     }
 
     state.as_ref().lock().event_callback = event_callback;
@@ -4099,6 +4160,28 @@ extern "C" fn toggle_tab_bar(this: &AnyObject, _sel: Sel, _id: *mut AnyObject) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn held_modifier_press_identity_survives_logical_key_changes() {
+        let mut keys = super::ConsumedHeldKeys::default();
+        keys.record(18, "1".into());
+        let mut repeat = gpui::KeyDownEvent {
+            keystroke: gpui::Keystroke::parse("!->!").unwrap(),
+            is_held: true,
+            prefer_character_input: false,
+        };
+        assert!(keys.key_down(18, &mut repeat));
+        assert_eq!(repeat.keystroke.key, "1");
+        assert_eq!(keys.release(18).as_deref(), Some("1"));
+        assert!(!keys.key_down(18, &mut repeat));
+        keys.record(3, "f".into());
+        repeat.is_held = false;
+        assert!(!keys.key_down(3, &mut repeat));
+        assert!(
+            keys.release(3).is_none(),
+            "fresh presses recover from missed releases"
+        );
+    }
+
     use super::*;
 
     #[test]

@@ -51,7 +51,7 @@
 
 use crate::{
     Action, ActionRegistry, App, DispatchPhase, EntityId, FocusId, KeyBinding, KeyContext, Keymap,
-    Keystroke, ModifiersChangedEvent, Window,
+    Keystroke, ModifiersChangedEvent, SharedString, Window,
 };
 use collections::FxHashMap;
 use smallvec::SmallVec;
@@ -449,16 +449,17 @@ impl DispatchTree {
         &self,
         input: &[Keystroke],
         dispatch_path: &SmallVec<[DispatchNodeId; 32]>,
+        held: &[SharedString],
     ) -> (SmallVec<[KeyBinding; 1]>, bool, Vec<KeyContext>) {
         let context_stack: Vec<KeyContext> = dispatch_path
             .iter()
             .filter_map(|node_id| self.node(*node_id).context.clone())
             .collect();
 
-        let (bindings, partial) = self
-            .keymap
-            .borrow()
-            .bindings_for_input(input, &context_stack);
+        let (bindings, partial) =
+            self.keymap
+                .borrow()
+                .bindings_for_input_with_held(input, &context_stack, held);
         (bindings, partial, context_stack)
     }
 
@@ -480,14 +481,26 @@ impl DispatchTree {
     /// - pending: the new set of pending keystrokes to store
     /// - to_replay: any keystroke that had been pushed to pending, but are no-longer matched,
     ///   these should be replayed first.
+    #[cfg(test)]
     pub fn dispatch_key(
+        &mut self,
+        input: SmallVec<[Keystroke; 1]>,
+        keystroke: Keystroke,
+        dispatch_path: &SmallVec<[DispatchNodeId; 32]>,
+    ) -> DispatchResult {
+        self.dispatch_key_with_held(input, keystroke, dispatch_path, &[])
+    }
+
+    pub fn dispatch_key_with_held(
         &mut self,
         mut input: SmallVec<[Keystroke; 1]>,
         keystroke: Keystroke,
         dispatch_path: &SmallVec<[DispatchNodeId; 32]>,
+        held: &[SharedString],
     ) -> DispatchResult {
         input.push(keystroke.clone());
-        let (bindings, pending, context_stack) = self.bindings_for_input(&input, dispatch_path);
+        let (bindings, pending, context_stack) =
+            self.bindings_for_input(&input, dispatch_path, held);
 
         if pending {
             return DispatchResult {
@@ -510,9 +523,9 @@ impl DispatchTree {
         }
         input.pop();
 
-        let (suffix, mut to_replay) = self.replay_prefix(input, dispatch_path);
+        let (suffix, mut to_replay) = self.replay_prefix(input, dispatch_path, held);
 
-        let mut result = self.dispatch_key(suffix, keystroke, dispatch_path);
+        let mut result = self.dispatch_key_with_held(suffix, keystroke, dispatch_path, held);
         to_replay.extend(result.to_replay);
         result.to_replay = to_replay;
         result
@@ -524,11 +537,12 @@ impl DispatchTree {
         &mut self,
         input: SmallVec<[Keystroke; 1]>,
         dispatch_path: &SmallVec<[DispatchNodeId; 32]>,
+        held: &[SharedString],
     ) -> SmallVec<[Replay; 1]> {
-        let (suffix, mut to_replay) = self.replay_prefix(input, dispatch_path);
+        let (suffix, mut to_replay) = self.replay_prefix(input, dispatch_path, held);
 
         if !suffix.is_empty() {
-            to_replay.extend(self.flush_dispatch(suffix, dispatch_path))
+            to_replay.extend(self.flush_dispatch(suffix, dispatch_path, held))
         }
 
         to_replay
@@ -539,10 +553,11 @@ impl DispatchTree {
         &self,
         mut input: SmallVec<[Keystroke; 1]>,
         dispatch_path: &SmallVec<[DispatchNodeId; 32]>,
+        held: &[SharedString],
     ) -> (SmallVec<[Keystroke; 1]>, SmallVec<[Replay; 1]>) {
         let mut to_replay: SmallVec<[Replay; 1]> = Default::default();
         for last in (0..input.len()).rev() {
-            let (bindings, _, _) = self.bindings_for_input(&input[0..=last], dispatch_path);
+            let (bindings, _, _) = self.bindings_for_input(&input[0..=last], dispatch_path, held);
             if !bindings.is_empty() {
                 to_replay.push(Replay {
                     keystroke: input.drain(0..=last).next_back().unwrap(),
@@ -872,11 +887,180 @@ mod tests {
         (cx, action_count, secondary_action_count)
     }
 
+    #[crate::test]
+    fn held_modifiers_dispatch_without_taps_or_prefix_timeouts(cx: &mut TestAppContext) {
+        let (cx, ordinary, word) = setup_pending_input_test(
+            cx,
+            [
+                KeyBinding::new("ctrl-f", crate::NoAction, Some("Terminal"))
+                    .with_held_modifier("word".into())
+                    .unwrap(),
+                KeyBinding::new("ctrl-l", SecondaryTestAction, Some("Terminal"))
+                    .with_when_held(["word".into()]),
+                KeyBinding::new("ctrl-l", TestAction, Some("Terminal")),
+                // Even later ordinary bindings and sequences cannot steal modifier presses.
+                KeyBinding::new("ctrl-f", TestAction, Some("Terminal")),
+                KeyBinding::new("ctrl-f x", TestAction, Some("Terminal")),
+            ],
+        );
+        let down = |cx: &mut VisualTestContext, source, is_held| {
+            cx.simulate_event(KeyDownEvent {
+                keystroke: Keystroke::parse(source).unwrap(),
+                is_held,
+                prefer_character_input: false,
+            });
+        };
+        let up = |cx: &mut VisualTestContext, source| {
+            cx.simulate_event(crate::KeyUpEvent {
+                keystroke: Keystroke::parse(source).unwrap(),
+            });
+        };
+        down(cx, "ctrl-l", false);
+        assert_eq!(ordinary.get(), 1);
+        down(cx, "ctrl-f", false);
+        cx.update(|window, _| assert!(!window.has_pending_keystrokes()));
+        assert_eq!(ordinary.get(), 1);
+        for repeat in [false, true, true, false] {
+            down(cx, "ctrl-l", repeat);
+        }
+        assert_eq!(word.get(), 4);
+        up(cx, "ctrl-f");
+        down(cx, "ctrl-l", false);
+        assert_eq!(ordinary.get(), 2);
+        assert_eq!(word.get(), 4);
+        down(cx, "ctrl-f", false);
+        up(cx, "ctrl-f");
+        assert_eq!(ordinary.get(), 2);
+        assert_eq!(word.get(), 4);
+        // Control released first: no tap action, repeat, or standalone Control action.
+        down(cx, "ctrl-f", false);
+        cx.simulate_modifiers_change(Modifiers::none());
+        down(cx, "f", true);
+        up(cx, "f");
+        assert_eq!(ordinary.get(), 2);
+        assert_eq!(word.get(), 4);
+    }
+
+    #[crate::test]
+    fn held_modifiers_cancel_on_focus_and_keymap_changes(cx: &mut TestAppContext) {
+        let (cx, ordinary, word) = setup_pending_input_test(
+            cx,
+            [
+                KeyBinding::new("ctrl-f", crate::NoAction, Some("Terminal"))
+                    .with_held_modifier("word".into())
+                    .unwrap(),
+                KeyBinding::new("ctrl-l", TestAction, Some("Terminal")),
+                KeyBinding::new("ctrl-l", SecondaryTestAction, Some("Terminal"))
+                    .with_when_held(["word".into()]),
+            ],
+        );
+        cx.run_until_parked();
+        let down = |cx: &mut VisualTestContext, source, is_held| {
+            cx.simulate_event(KeyDownEvent {
+                keystroke: Keystroke::parse(source).unwrap(),
+                is_held,
+                prefer_character_input: false,
+            });
+        };
+        down(cx, "ctrl-f", false);
+        down(cx, "ctrl-l", false);
+        assert_eq!(word.get(), 1);
+        cx.update(|window, cx| {
+            let focus = window.focused(cx).unwrap();
+            window.blur(cx);
+            window.focus(&focus, cx);
+        });
+        down(cx, "ctrl-f", true);
+        down(cx, "ctrl-l", false);
+        assert_eq!(ordinary.get(), 1);
+        assert_eq!(word.get(), 1);
+        down(cx, "ctrl-f", false);
+        cx.deactivate_window();
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        down(cx, "ctrl-f", true);
+        down(cx, "ctrl-l", false);
+        assert_eq!(ordinary.get(), 2);
+        assert_eq!(word.get(), 1);
+        down(cx, "ctrl-f", false);
+        cx.update(|_, cx| {
+            cx.clear_key_bindings();
+            cx.bind_keys([
+                KeyBinding::new("ctrl-s", crate::NoAction, Some("Terminal"))
+                    .with_held_modifier("word".into())
+                    .unwrap(),
+                KeyBinding::new("ctrl-l", TestAction, Some("Terminal")),
+                KeyBinding::new("ctrl-l", SecondaryTestAction, Some("Terminal"))
+                    .with_when_held(["word".into()]),
+            ]);
+        });
+        down(cx, "ctrl-f", true);
+        down(cx, "ctrl-l", false);
+        assert_eq!(ordinary.get(), 3);
+        assert_eq!(word.get(), 1);
+        down(cx, "ctrl-s", false);
+        down(cx, "ctrl-l", false);
+        assert_eq!(word.get(), 2);
+    }
+
     #[derive(Debug, PartialEq)]
     struct ObservedKeystroke {
         keystroke: Keystroke,
         action_name: Option<&'static str>,
         context_stack: Vec<KeyContext>,
+    }
+
+    #[crate::test]
+    fn held_modifiers_consumed_presses_follow_window_changes(cx: &mut TestAppContext) {
+        let (cx, _, _) = setup_pending_input_test(
+            cx,
+            [KeyBinding::new("ctrl-f", crate::NoAction, Some("Terminal"))
+                .with_held_modifier("word".into())
+                .unwrap()],
+        );
+        cx.run_until_parked();
+        cx.simulate_keystrokes("ctrl-f");
+        let second = cx.update(|_, cx| {
+            cx.open_window(Default::default(), |window, cx| {
+                window.activate_window();
+                cx.new(|_| crate::EmptyView)
+            })
+            .unwrap()
+        });
+        cx.run_until_parked();
+        let second: crate::AnyWindowHandle = second.into();
+        second
+            .update(cx, |_, window, cx| {
+                let result = window.dispatch_event(
+                    PlatformInput::KeyDown(KeyDownEvent {
+                        keystroke: Keystroke::parse("f->f").unwrap(),
+                        is_held: true,
+                        prefer_character_input: false,
+                    }),
+                    cx,
+                );
+                assert!(
+                    !result.propagate,
+                    "a consumed press must not type in another window"
+                );
+                let result = window.dispatch_event(
+                    PlatformInput::KeyUp(crate::KeyUpEvent {
+                        keystroke: Keystroke::parse("f").unwrap(),
+                    }),
+                    cx,
+                );
+                assert!(!result.propagate);
+                let result = window.dispatch_event(
+                    PlatformInput::KeyDown(KeyDownEvent {
+                        keystroke: Keystroke::parse("f->f").unwrap(),
+                        is_held: false,
+                        prefer_character_input: false,
+                    }),
+                    cx,
+                );
+                assert!(result.propagate, "a new press must type normally");
+            })
+            .unwrap();
     }
 
     fn capture_observed_keystrokes(

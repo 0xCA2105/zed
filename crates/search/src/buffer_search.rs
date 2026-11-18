@@ -1923,6 +1923,83 @@ mod tests {
         });
     }
 
+    #[gpui::test]
+    async fn held_modifiers_example_moves_selects_and_reloads(cx: &mut TestAppContext) {
+        use gpui::{KeyDownEvent, KeyUpEvent, Keystroke};
+        use settings::{KeymapFile, KeymapFileLoadResult};
+
+        init_globals(cx);
+        let example = include_str!("../../../assets/keymaps/held-modifiers.example.json");
+        let load = |source: &str, cx: &mut App| {
+            let KeymapFileLoadResult::Success { key_bindings } = KeymapFile::load(source, cx)
+            else {
+                panic!("the complete example must load, including search actions");
+            };
+            cx.clear_key_bindings();
+            cx.bind_keys(key_bindings);
+        };
+        cx.update(|cx| load(example, cx));
+        let mut cx = EditorTestContext::new(cx).await;
+        let down = |cx: &mut EditorTestContext, source, is_held| {
+            cx.simulate_event(KeyDownEvent {
+                keystroke: Keystroke::parse(source).unwrap(),
+                is_held,
+                prefer_character_input: false,
+            })
+        };
+        let up = |cx: &mut EditorTestContext, source| {
+            cx.simulate_event(KeyUpEvent {
+                keystroke: Keystroke::parse(source).unwrap(),
+            })
+        };
+
+        cx.set_state("ˇone two three");
+        down(&mut cx, "ctrl-l", false);
+        cx.assert_editor_state("oˇne two three");
+        down(&mut cx, "ctrl-f", false);
+        down(&mut cx, "ctrl-l", false);
+        cx.assert_editor_state("oneˇ two three");
+        down(&mut cx, "ctrl-l", true);
+        cx.assert_editor_state("one twoˇ three");
+        up(&mut cx, "ctrl-f");
+        down(&mut cx, "ctrl-l", false);
+        cx.assert_editor_state("one two ˇthree");
+        down(&mut cx, "ctrl-d", false);
+        down(&mut cx, "ctrl-l", false);
+        cx.assert_editor_state("one two «tˇ»hree");
+        up(&mut cx, "ctrl-d");
+
+        for (first, second) in [("ctrl-f", "ctrl-d"), ("ctrl-d", "ctrl-f")] {
+            cx.set_state("ˇone two three");
+            down(&mut cx, first, false);
+            down(&mut cx, second, false);
+            down(&mut cx, "ctrl-l", false);
+            cx.assert_editor_state("«oneˇ» two three");
+            up(&mut cx, first);
+            up(&mut cx, second);
+        }
+        cx.set_state("ˇone two");
+        for key in ["ctrl-f", "ctrl-d"] {
+            down(&mut cx, key, false);
+            up(&mut cx, key);
+            cx.assert_editor_state("ˇone two");
+        }
+        cx.simulate_keystrokes("f d");
+        cx.assert_editor_state("fdˇone two");
+
+        // Reload JSON while F is physically held, using Zed's clear/bind mechanism.
+        down(&mut cx, "ctrl-f", false);
+        cx.update(|_, cx| load(&example.replace("ctrl-f", "ctrl-s"), cx));
+        down(&mut cx, "f", true);
+        up(&mut cx, "f");
+        cx.assert_editor_state("fdˇone two");
+        cx.set_state("ˇone two");
+        down(&mut cx, "ctrl-s", false);
+        down(&mut cx, "ctrl-l", false);
+        cx.assert_editor_state("oneˇ two");
+        up(&mut cx, "ctrl-s");
+    }
+
     fn init_multibuffer_test(
         cx: &mut TestAppContext,
     ) -> (

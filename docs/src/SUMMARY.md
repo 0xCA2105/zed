@@ -225,6 +225,7 @@
 
 - [Developing Zed](./development.md)
   - [macOS](./development/macos.md)
+  - [Held-key modifiers in this fork](./development/held-modifiers.md)
   - [Linux](./development/linux.md)
   - [Windows](./development/windows.md)
   - [FreeBSD](./development/freebsd.md)

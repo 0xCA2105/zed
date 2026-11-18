@@ -1,0 +1,54 @@
+[
+  {
+    "context": "Editor && mode == full",
+    "held_modifiers": {
+      "ctrl-f": { "name": "word" },
+      "ctrl-d": { "name": "select" }
+    },
+    "bindings": {
+      "ctrl-j": "editor::MoveLeft",
+      "ctrl-i": "editor::MoveUp",
+      "ctrl-k": "editor::MoveDown",
+      "ctrl-l": "editor::MoveRight",
+      "ctrl-u": ["editor::MoveToBeginningOfLine", { "stop_at_soft_wraps": false, "stop_at_indent": false }],
+      "ctrl-o": ["editor::MoveToEndOfLine", { "stop_at_soft_wraps": false }],
+      "ctrl-y": "editor::MovePageUp",
+      "ctrl-h": "editor::MovePageDown",
+      "ctrl-m": "editor::Backspace",
+      "ctrl-;": "editor::Delete",
+      "ctrl-shift-m": "editor::DeleteLine",
+      "ctrl-n": "editor::NewlineBelow",
+      "ctrl-shift-n": "editor::NewlineAbove",
+      "ctrl-g": "search::SelectNextMatch",
+      "ctrl-shift-g": "search::SelectPreviousMatch"
+    }
+  },
+  {
+    "context": "Editor && mode == full",
+    "when_held": ["word"],
+    "bindings": {
+      "ctrl-j": "editor::MoveToPreviousWordStart",
+      "ctrl-l": "editor::MoveToNextWordEnd"
+    }
+  },
+  {
+    "context": "Editor && mode == full",
+    "when_held": ["select"],
+    "bindings": {
+      "ctrl-j": "editor::SelectLeft",
+      "ctrl-i": "editor::SelectUp",
+      "ctrl-k": "editor::SelectDown",
+      "ctrl-l": "editor::SelectRight",
+      "ctrl-u": ["editor::SelectToBeginningOfLine", { "stop_at_soft_wraps": false, "stop_at_indent": false }],
+      "ctrl-o": ["editor::SelectToEndOfLine", { "stop_at_soft_wraps": false }]
+    }
+  },
+  {
+    "context": "Editor && mode == full",
+    "when_held": ["word", "select"],
+    "bindings": {
+      "ctrl-j": "editor::SelectToPreviousWordStart",
+      "ctrl-l": "editor::SelectToNextWordEnd"
+    }
+  }
+]

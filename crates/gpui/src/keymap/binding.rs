@@ -14,6 +14,8 @@ pub struct KeyBinding {
     pub(crate) meta: Option<KeyBindingMetaIndex>,
     /// The json input string used when building the keybinding, if any
     pub(crate) action_input: Option<SharedString>,
+    pub(crate) held_modifier: Option<SharedString>,
+    pub(crate) when_held: SmallVec<[SharedString; 2]>,
 }
 
 impl Clone for KeyBinding {
@@ -24,6 +26,8 @@ impl Clone for KeyBinding {
             context_predicate: self.context_predicate.clone(),
             meta: self.meta,
             action_input: self.action_input.clone(),
+            held_modifier: self.held_modifier.clone(),
+            when_held: self.when_held.clone(),
         }
     }
 }
@@ -94,7 +98,39 @@ impl KeyBinding {
             context_predicate,
             meta: None,
             action_input,
+            held_modifier: None,
+            when_held: SmallVec::new(),
         })
+    }
+
+    /// Make this single keystroke an exclusive held modifier, rather than an action.
+    pub fn with_held_modifier(mut self, name: SharedString) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            self.keystrokes.len() == 1 && !self.keystrokes[0].as_keystroke().is_modifier_key(),
+            "held_modifiers requires one ordinary key, optionally with native modifiers; sequences and standalone native modifiers are not supported"
+        );
+        anyhow::ensure!(
+            self.when_held.is_empty(),
+            "held modifiers cannot depend on when_held"
+        );
+        self.held_modifier = Some(name);
+        Ok(self)
+    }
+
+    /// Require all of these named held modifiers for this binding.
+    pub fn with_when_held(mut self, names: impl IntoIterator<Item = SharedString>) -> Self {
+        self.when_held = names.into_iter().collect();
+        self
+    }
+
+    /// Name declared by this binding, if it is a held modifier declaration.
+    pub fn held_modifier(&self) -> Option<&SharedString> {
+        self.held_modifier.as_ref()
+    }
+
+    /// Names required by this binding.
+    pub fn when_held(&self) -> &[SharedString] {
+        &self.when_held
     }
 
     /// Set the metadata for this binding.
